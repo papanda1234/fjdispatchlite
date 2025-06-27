@@ -14,12 +14,15 @@ GCD enables concurrent code execution on multicore hardware efficiently.
 
 ## Implementation
 
-**fjdispatchlite** is a prototype implementation of the *dispatch* pattern using C++11.  
+**fjdispatchlite** is a prototype implementation of the *dispatch* pattern using C++14.  
 It's intended for educational purposes and to help understand the concept.  
 For production use, it is strongly recommended to use mature libraries such as [XDispatch](http://opensource.mlba-team.de/xdispatch/docs/current/index.html) or similar.
 
 ## Build
 
 ```sh
-% cmake .
+% make build
+% cd build
+% cmake ..
 % make
+
