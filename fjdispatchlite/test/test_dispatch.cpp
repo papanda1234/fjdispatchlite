@@ -9,9 +9,9 @@ public:
 
     virtual int onCall(uint32_t msg, void* buf, uint32_t len); 
 
-    BEGIN_MAP_MESSAGE( FJTestCall )
-    MAP_MESSAGE( MID_ON_ONCALL, FJTestCall::onCall )
-    END_MAP_MESSAGE()
+    BEGIN_MAP_MESSAGES( FJTestCall )
+    MAP_MESSAGES( MID_ON_ONCALL, FJTestCall::onCall )
+    END_MAP_MESSAGES()
 };
 
 int FJTestCall::onCall(uint32_t msg, void* buf, uint32_t len)
@@ -31,9 +31,9 @@ public:
     virtual void run(char *buf, uint len);
     virtual int onHold(uint32_t msg, void* buf, uint32_t len);
 
-    BEGIN_MAP_MESSAGE( FJTestHold )
-    MAP_MESSAGE( MID_ON_ONHOLD, FJTestHold::onHold )
-    END_MAP_MESSAGE()
+    BEGIN_MAP_MESSAGES( FJTestHold )
+    MAP_MESSAGES( MID_ON_ONHOLD, FJTestHold::onHold )
+    END_MAP_MESSAGES()
 
 };
 
@@ -47,7 +47,7 @@ int FJTestHold::onHold(uint32_t msg, void* buf, uint32_t len)
 
 void FJTestHold::run(char *buf, uint len)
 {
-    _SendMsgSelf( MID_ON_ONHOLD, C_MESSAGE_MID, buf, len );
+    SendMsgSelf_S( MID_ON_ONHOLD, C_MESSAGE_MID, buf, len );
 }
 
 int main() {

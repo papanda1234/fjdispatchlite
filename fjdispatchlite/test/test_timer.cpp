@@ -12,9 +12,9 @@ public:
     virtual int onHold(uint32_t msg, void* buf, uint32_t len);
     virtual int onTimer(fjt_handle_t handle, fjt_time_t now);
 
-    BEGIN_MAP_MESSAGE( FJTestHold )
-    MAP_MESSAGE( MID_ON_ONHOLD, FJTestHold::onHold )
-    END_MAP_MESSAGE()
+    BEGIN_MAP_MESSAGES( FJTestHold )
+    MAP_MESSAGES( MID_ON_ONHOLD, FJTestHold::onHold )
+    END_MAP_MESSAGES()
 
 };
 
@@ -22,14 +22,14 @@ int FJTestHold::onHold(uint32_t msg, void* buf, uint32_t len)
 {
     std::string s(static_cast<char *>(buf), len);
     std::cout << "onHold called for instance " << this << ": " << s << ": " << msg << std::endl;
-    _CreateTimer(&FJTestHold::onTimer, 500);
+    CreateTimer(&FJTestHold::onTimer, 500);
     return 0;
 }
 
 int FJTestHold::onTimer(fjt_handle_t timer, fjt_time_t now)
 {
     std::cout << "***onHoldTimer***" << std::endl;
-    _SendMsgSelf( MID_ON_ONHOLD, C_MESSAGE_MID, NULL, 0 );
+    SendMsgSelf_S( MID_ON_ONHOLD, C_MESSAGE_MID, NULL, 0 );
     return -1;
 }
 
