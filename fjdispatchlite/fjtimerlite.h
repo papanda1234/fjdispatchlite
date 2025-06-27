@@ -215,6 +215,7 @@ private:
 	FJUnitFrames *obj = NULL;
 	std::function<int(fjt_handle_t, fjt_time_t)> mf;
 	int result = -1;
+	fjt_time_t next_exec;
 	
 	{
 	    std::unique_lock<std::mutex> lock(mutex_);
@@ -226,6 +227,19 @@ private:
 	    {
 		std::unique_lock<std::mutex> lock(mutex_);
 		running_ = false;
+
+		auto now = std::chrono::steady_clock::now();
+		next_exec = now + std::chrono::milliseconds(FJTIMERLITE_MAX_TICK_MSEC);
+		for (const auto& kv : timers_) {
+		    const TimerInfo& t = kv.second;
+		    if (t.active && t.next_time < next_exec)
+			next_exec = t.next_time;
+		}
+		
+		wait = std::chrono::duration_cast<std::chrono::milliseconds>(next_exec - now).count();
+		if (wait < FJTIMERLITE_MIN_TICK_MSEC)
+		    wait = FJTIMERLITE_MIN_TICK_MSEC;
+
 		cond_var_.wait_for(lock, std::chrono::milliseconds(wait));
 
 		if (stop_) return;
@@ -239,7 +253,7 @@ private:
 		    continue;
 		}
 
-		auto now = std::chrono::steady_clock::now();
+		now = std::chrono::steady_clock::now();
 		TimerInfo& timer = it->second;
 
 		if (!timer.active || now < timer.next_time) {

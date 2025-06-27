@@ -4,13 +4,22 @@
 class FJDispatchLite;
 class FJTimerLite;
 
-#define BEGIN_MAP_MESSAGE(x)
-#define MAP_MESSAGE(mid, func) static constexpr auto g_funcptr_##mid = &func;
-#define END_MAP_MESSAGE()
+#ifndef MAP_MESSAGES
+#define BEGIN_MAP_MESSAGES(x)
+#define MAP_MESSAGES(mid, func) static constexpr auto g_funcptr_##mid = &func;
+#define END_MAP_MESSAGES()
+#endif //MAP_MESSAGES
 
-#define _SendMsgSelf(mid, prio, buf, size) FJDispatchLite::GetInstance()->postQueue(this, g_funcptr_##mid, mid, buf, size, true, __FUNCTION__, __LINE__)
-#define _SendMsgSelf_P(mid, prio, buf, size) FJDispatchLite::GetInstance()->postQueue(this, g_funcptr_##mid, mid, buf, size, false, __FUNCTION__, __LINE__)
-#define _CreateTimer(mf, msec) FJTimerLite::GetInstance()->createTimer(this, mf, msec, __FUNCTION__, __LINE__)
+#ifndef MAP_EVENTS
+#define BEGIN_MAP_EVENTS(x)
+#define MAP_EVENTS(mid, func) static constexpr auto g_funcptr_##mid = &func;
+#define END_MAP_EVENTS()
+#endif //MAP_EVENTS
+
+#define SendEvtSelf_S(mid) FJDispatchLite::GetInstance()->postEvent(this, g_funcptr_##mid, mid, __PRETTY_FUNCTION__, __LINE__)
+#define SendMsgSelf_S(mid, prio, buf, size) FJDispatchLite::GetInstance()->postQueue(this, g_funcptr_##mid, mid, buf, size, true, __PRETTY_FUNCTION__, __LINE__)
+#define SendMsgSelf_P(mid, prio, buf, size) FJDispatchLite::GetInstance()->postQueue(this, g_funcptr_##mid, mid, buf, size, false, __PRETTY_FUNCTION__, __LINE__)
+#define CreateTimer(mf, msec) FJTimerLite::GetInstance()->createTimer(this, mf, msec, __PRETTY_FUNCTION__, __LINE__)
 
 /**
  * @enum 実行優先度

@@ -32,18 +32,26 @@
 #include <functional>
 #include <vector>
 #include <cstring>
+#include <future>
+#include <stdint.h>
+#include <time.h>
 #endif
 
 #include "fjtypes.h"
 #include "fjunitframes.h"
 
-#define FJDISPATCHLITE_DEFAULT_THREADS (2) //!< ワーカースレッド数初期値
-#define FJDISPATCHLITE_MAX_THREADS (10) //!< ワーカースレッド数最大値
+#define FJDISPATCHLITE_DEFAULT_THREADS (6) //!< ワーカースレッド数初期値
+#define FJDISPATCHLITE_MAX_THREADS (12) //!< ワーカースレッド数最大値
 #define FJDISPATCHLITE_MAX_RESULTS (100) //!< リザルトキューの最大値
 
+#define FJDISPATCHLITE_DBG (0) //!< デバッグフラグ
 #define FJDISPATCHLITE_PROFILE_DBG (0) //!< メソッド実行プロファイラ
 #define FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC (200) //!< postQueueしてから実行されるまでの遅延許容値(msec)
 #define FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC (100) //!< メソッド実行にかかる時間の許容値(msec)
+
+#define COLOR_RED     "\033[31m"
+#define COLOR_CYAN    "\033[36m"
+#define COLOR_RESET   "\033[0m"
 
 // 前方参照
 class FJTimerLite;
@@ -89,8 +97,8 @@ public:
      * @param[in] isseq [true]:obj単位でシーケンシャルに実行, [false]:パラレル実行(メソッド間の資源排他を行うこと)
      * @param[in] srcfunc デバッグ表示用呼び出し関数名
      * @param[in] srcline デバッグ表示用呼び出し行数
-     * @return ハンドル
-     */
+     * @return ハンドル 
+    */
     template <typename T>
     fjt_handle_t postQueue(T* obj, int (T::*mf)(uint32_t, void*, uint32_t), uint32_t msg, void* buf, uint32_t len, bool isseq, std::string srcfunc, uint32_t srcline) {
 	static_assert(std::is_base_of<FJUnitFrames, T>::value, "T must derive from FJUnitFrames");
@@ -118,14 +126,26 @@ public:
             }
             result_cv_.notify_all();
         }
-       
+#if FJDISPATCHLITE_DBG == 1
+	{
+	    uint32_t timeMs;
+	    struct timespec ts;
+	    int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+	    timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << COLOR_RESET << std::endl;
+	}
+#endif
 	// lambda式でタスクを定義
-	auto task = [obj, mf, msg, buf_copy, len, srcfunc_copy, srcline, start, result, handle, this]() {
+	auto lambda = [obj, mf, msg, buf_copy, len, srcfunc_copy, srcline, start, result, handle, this]() {
 #if FJDISPATCHLITE_PROFILE_DBG == 1
 	    auto delay = std::chrono::steady_clock::now();
 	    auto elapsed1 = std::chrono::duration_cast<std::chrono::milliseconds>(delay - start);	    
 	    if (elapsed1.count() > FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC) {
-		std::cerr << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is delayed. " << elapsed1.count() << " msec." << std::endl;
+		uint32_t timeMs;
+		struct timespec ts;
+		int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+		timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+		std::cerr << COLOR_RED << "[" << timeMs << "]:" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is DELAYED. " << elapsed1.count() << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
 	    int ret = (obj->*mf)(msg, buf_copy, len);
@@ -133,7 +153,11 @@ public:
 	    auto now = std::chrono::steady_clock::now();
 	    auto elapsed2 = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
 	    if (elapsed2.count() > FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC) {
-		std::cerr << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is too long. " << elapsed2.count() << " msec." << std::endl;
+		uint32_t timeMs;
+		struct timespec ts;
+		int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+		timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+		std::cerr << COLOR_RED << "[" << timeMs << "]" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is TOO LONG. " << elapsed2.count() << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
 
@@ -150,6 +174,8 @@ public:
 
         };
 
+	auto task = std::make_unique<std::packaged_task<void()>>(lambda);
+
 	// インスタンスのタスクキューに所有権を移動
         std::unique_lock<std::mutex> lock(mutex_);
 	auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
@@ -165,6 +191,168 @@ public:
 	    if (ready_instances_.size() >= num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
 		workers_.emplace_back(&FJDispatchLite::workerThread, this);
 		++num_of_threads_;
+#if FJDISPATCHLITE_DBG != 0
+		std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
+#endif
+	    }
+            cv_.notify_one();
+        }
+
+	return handle;
+    }
+
+    /**
+     * @brief キューにイベントを積む
+     * @note 本クラスから呼び出されるFJUnitFramesの生存期間はユーザーが保証すること。
+     * @param[in] obj FJUnitFramesのポインタ
+     * @param[in] mf FJUnitFramesのメソッド
+     * @param[in] msg メッセージID
+     * @param[in] srcfunc デバッグ表示用呼び出し関数名
+     * @param[in] srcline デバッグ表示用呼び出し行数
+     * @return ハンドル 
+    */
+    template <typename T>
+    fjt_handle_t postEvent(T* obj, int (T::*mf)(uint32_t), uint32_t msg, std::string srcfunc, uint32_t srcline) {
+	static_assert(std::is_base_of<FJUnitFrames, T>::value, "T must derive from FJUnitFrames");
+	// start_time
+	auto start = std::chrono::steady_clock::now();
+	// srcfuncをコピー
+	char *srcfunc_copy = new char[srcfunc.size()+1];
+	std::strcpy(srcfunc_copy, srcfunc.c_str());
+
+	auto result = std::make_shared<ResultItem>();
+	fjt_handle_t handle;
+	{
+            std::lock_guard<std::mutex> lock(result_mutex_);
+            handle = ++handle_counter_;
+	    // 結果アイテムの登録と古い結果をキューから削除
+            results_[handle] = result;
+            result_order_.push_back(handle);
+            if (result_order_.size() > FJDISPATCHLITE_MAX_RESULTS) {
+                fjt_handle_t old = result_order_.front();
+                result_order_.pop_front();
+                results_.erase(old);
+            }
+            result_cv_.notify_all();
+        }
+#if FJDISPATCHLITE_DBG == 1
+	{
+	    uint32_t timeMs;
+	    struct timespec ts;
+	    int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+	    timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << COLOR_RESET << std::endl;
+	}
+#endif
+	// lambda式でタスクを定義
+	auto lambda = [obj, mf, msg, srcfunc_copy, srcline, start, result, handle, this]() {
+#if FJDISPATCHLITE_PROFILE_DBG == 1
+	    auto delay = std::chrono::steady_clock::now();
+	    auto elapsed1 = std::chrono::duration_cast<std::chrono::milliseconds>(delay - start);	    
+	    if (elapsed1.count() > FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC) {
+		uint32_t timeMs;
+		struct timespec ts;
+		int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+		timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+		std::cerr << COLOR_RED << "[" << timeMs << "]:" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is DELAYED. " << elapsed1.count() << " msec." << COLOR_RESET << std::endl;
+	    }
+#endif
+	    int ret = (obj->*mf)(msg);
+#if FJDISPATCHLITE_PROFILE_DBG == 1
+	    auto now = std::chrono::steady_clock::now();
+	    auto elapsed2 = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+	    if (elapsed2.count() > FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC) {
+		uint32_t timeMs;
+		struct timespec ts;
+		int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+		timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+		std::cerr << COLOR_RED << "[" << timeMs << "]" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is TOO LONG. " << elapsed2.count() << " msec." << COLOR_RESET << std::endl;
+	    }
+#endif
+
+	    delete[] srcfunc_copy;
+
+	    // 結果の登録
+	    auto it = results_.find(handle);
+            if (it != results_.end()) {
+                it->second->value = ret;
+                it->second->ready = true;
+                it->second->cv.notify_all();
+            }
+
+        };
+
+	auto task = std::make_unique<std::packaged_task<void()>>(lambda);
+
+	// インスタンスのタスクキューに所有権を移動
+        std::unique_lock<std::mutex> lock(mutex_);
+	auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
+        inst_info.task_queue.push(std::move(task));
+
+	// インスタンスのタスクキューが実行中でないか、パラで動作させるフラグが立っていたら
+	if (!inst_info.running) {
+	    // 実行待ちタスクに登録して実行中に
+	    ready_instances_.push(static_cast<FJUnitFrames*>(obj));
+            inst_info.running = true;
+
+	    // ワーカースレッドを必要に応じて拡張
+	    if (ready_instances_.size() >= num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
+		workers_.emplace_back(&FJDispatchLite::workerThread, this);
+		++num_of_threads_;
+#if FJDISPATCHLITE_DBG != 0
+		std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
+#endif
+	    }
+            cv_.notify_one();
+        }
+
+	return handle;
+    }
+
+    /**
+     * @brief キューにタスクを積む
+     * @note 本クラスから呼び出されるFJUnitFramesの生存期間はユーザーが保証すること。
+     * @param[in] obj FJUnitFramesのポインタ
+     * @param[in] task std::packaged_task
+     */
+    template <typename T>
+    fjt_handle_t enqueueTask(T* obj, std::packaged_task<void()>&& task) {
+	static_assert(std::is_base_of<FJUnitFrames, T>::value, "T must derive from FJUnitFrames");
+	fjt_handle_t handle;
+	{
+            std::lock_guard<std::mutex> lock(result_mutex_);
+            handle = ++handle_counter_;
+	}
+
+#if FJDISPATCHLITE_DBG == 1
+	{
+	    uint32_t timeMs;
+	    struct timespec ts;
+	    int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+	    timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << COLOR_RESET << std::endl;
+	}
+#endif
+
+	// インスタンスのタスクキューに所有権を移動
+        std::unique_lock<std::mutex> lock(mutex_);
+	auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
+	auto task_ptr = std::make_unique<std::packaged_task<void()>>(std::move(task));
+	inst_info.task_queue.push(std::move(task_ptr));
+
+	// インスタンスのタスクキューが実行中でないか、パラで動作させるフラグが立っていたら
+	if (!inst_info.running) {
+	    // 実行待ちタスクに登録して実行中に
+	    ready_instances_.push(static_cast<FJUnitFrames*>(obj));
+            inst_info.running = true;
+
+	    // ワーカースレッドを必要に応じて拡張
+	    if (ready_instances_.size() >= num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
+		workers_.emplace_back(&FJDispatchLite::workerThread, this);
+		++num_of_threads_;
+#if FJDISPATCHLITE_DBG != 0
+		std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
+#endif
 	    }
             cv_.notify_one();
         }
@@ -211,7 +399,7 @@ private:
      * @brief 各FJUintFramesごとのインスタンス情報
      */
     struct InstanceInfo {
-        std::queue<std::function<void()>> task_queue; //!<< タスクキュー
+	std::queue<std::unique_ptr<std::packaged_task<void()>>> task_queue; //!< タスクキュー
         bool running = false; //!< このインスタンスのタスクがスレッドで実行中か
     };
     
@@ -258,7 +446,7 @@ private:
     void workerThread() {
         while(true) {
             FJUnitFrames* inst = nullptr;
-            std::function<void()> task;
+	    std::unique_ptr<std::packaged_task<void()>> task;
 
             {
                 std::unique_lock<std::mutex> lock(mutex_);
@@ -287,7 +475,7 @@ private:
             }
 
             // タスク実行(排他範囲外にしておくこと)
-            task();
+            (*task)();
 
             {
                 std::unique_lock<std::mutex> lock(mutex_);
