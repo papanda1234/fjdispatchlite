@@ -28,6 +28,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <string>
+#include <algorithm>
 #include <unordered_map>
 #include <functional>
 #include <vector>
@@ -40,14 +42,17 @@
 #include "fjtypes.h"
 #include "fjunitframes.h"
 
-#define FJDISPATCHLITE_DEFAULT_THREADS (6) //!< ワーカースレッド数初期値
-#define FJDISPATCHLITE_MAX_THREADS (12) //!< ワーカースレッド数最大値
+#define FJDISPATCHLITE_DEFAULT_THREADS (2) //!< ワーカースレッド数初期値
+#define FJDISPATCHLITE_MAX_THREADS (8) //!< ワーカースレッド数最大値
 #define FJDISPATCHLITE_MAX_RESULTS (100) //!< リザルトキューの最大値
 
 #define FJDISPATCHLITE_DBG (0) //!< デバッグフラグ
 #define FJDISPATCHLITE_PROFILE_DBG (0) //!< メソッド実行プロファイラ
+#define FJDISPATCHLITE_PROFILE_ENQUEUE (0) //!< enqueueTaskデバッグフラグ
+#define FJDISPATCHLITE_PROFILE_ENQUEUE_MSEC (10000)  //!< enqueueTask統計情報を出力する間隔(msec)
+#define FJDISPATCHLITE_PROFILE_ENQUEUE_HNUM (100)  //!< enqueueTask統計情報を出力するハンドル数
 #define FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC (200) //!< postQueueしてから実行されるまでの遅延許容値(msec)
-#define FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC (100) //!< メソッド実行にかかる時間の許容値(msec)
+#define FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC (200) //!< メソッド実行にかかる時間の許容値(msec)
 
 #define COLOR_RED     "\033[31m"
 #define COLOR_CYAN    "\033[36m"
@@ -63,6 +68,15 @@ class FJTimerLite;
 class FJDispatchLite {
 public:
     friend class FJTimerLite;
+
+    /**
+     * @brief 各ハンドルごとの実行結果
+     */
+    struct ResultItem {
+	int value; //!< タスクの返り値
+	std::condition_variable cv; //!< タスク完了の状態変数
+	bool ready = false; //!< 実行結果を受け取ったか
+    };
 
     /*
      * @brief シングルトン
@@ -84,6 +98,44 @@ public:
         for(auto& t : workers_) {
             if(t.joinable()) t.join();
         }
+    }
+
+    /**
+     * @brief 結果アイテムの生成
+     * @param[out] handle ハンドル
+     * @param[out] result 結果アイテム
+     */
+    void _new_resultitem( fjt_handle_t &handle, std::shared_ptr<ResultItem> &result )
+    {
+	handle = getHandle();
+	{
+	    std::lock_guard<std::mutex> lock(result_mutex_);
+	    // 結果アイテムの登録と古い結果をキューから削除
+	    results_[handle] = result;
+	    result_order_.push_back(handle);
+	    if (result_order_.size() > FJDISPATCHLITE_MAX_RESULTS) {
+		fjt_handle_t old = result_order_.front();
+		result_order_.pop_front();
+		results_.erase(old);
+	    }
+	    result_cv_.notify_all();
+	}
+    }
+
+    /**
+     * @brief 結果の登録
+     * @param[in] handle ハンドル
+     * @param[in] value 結果
+     */
+    void _post_resultitem( fjt_handle_t handle, int value)
+    {
+	std::lock_guard<std::mutex> lock(result_mutex_);
+	auto it = results_.find(handle);
+	if (it != results_.end()) {
+	    it->second->value = value;
+	    it->second->ready = true;
+	    it->second->cv.notify_all();
+	}
     }
 
     /**
@@ -110,28 +162,13 @@ public:
 	// srcfuncをコピー
 	char *srcfunc_copy = new char[srcfunc.size()+1];
 	std::strcpy(srcfunc_copy, srcfunc.c_str());
-
-	auto result = std::make_shared<ResultItem>();
+	// ResultItem
 	fjt_handle_t handle;
-	{
-            std::lock_guard<std::mutex> lock(result_mutex_);
-            handle = ++handle_counter_;
-	    // 結果アイテムの登録と古い結果をキューから削除
-            results_[handle] = result;
-            result_order_.push_back(handle);
-            if (result_order_.size() > FJDISPATCHLITE_MAX_RESULTS) {
-                fjt_handle_t old = result_order_.front();
-                result_order_.pop_front();
-                results_.erase(old);
-            }
-            result_cv_.notify_all();
-        }
+	auto result = std::make_shared<ResultItem>();
+	_new_resultitem( handle, result );
 #if FJDISPATCHLITE_DBG == 1
 	{
-	    uint32_t timeMs;
-	    struct timespec ts;
-	    int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-	    timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+	    uint32_t timeMs = _get_time();
 	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << COLOR_RESET << std::endl;
 	}
 #endif
@@ -141,10 +178,7 @@ public:
 	    auto delay = std::chrono::steady_clock::now();
 	    auto elapsed1 = std::chrono::duration_cast<std::chrono::milliseconds>(delay - start);	    
 	    if (elapsed1.count() > FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC) {
-		uint32_t timeMs;
-		struct timespec ts;
-		int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-		timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+		uint32_t timeMs = _get_time();
 		std::cerr << COLOR_RED << "[" << timeMs << "]:" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is DELAYED. " << elapsed1.count() << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
@@ -153,10 +187,7 @@ public:
 	    auto now = std::chrono::steady_clock::now();
 	    auto elapsed2 = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
 	    if (elapsed2.count() > FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC) {
-		uint32_t timeMs;
-		struct timespec ts;
-		int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-		timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+		uint32_t timeMs = _get_time();
 		std::cerr << COLOR_RED << "[" << timeMs << "]" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is TOO LONG. " << elapsed2.count() << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
@@ -165,13 +196,7 @@ public:
             delete[] buf_copy;
 
 	    // 結果の登録
-	    auto it = results_.find(handle);
-            if (it != results_.end()) {
-                it->second->value = ret;
-                it->second->ready = true;
-                it->second->cv.notify_all();
-            }
-
+	    _post_resultitem(handle, ret);
         };
 
 	auto task = std::make_unique<std::packaged_task<void()>>(lambda);
@@ -188,13 +213,8 @@ public:
             inst_info.running = true;
 
 	    // ワーカースレッドを必要に応じて拡張
-	    if (ready_instances_.size() >= num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
-		workers_.emplace_back(&FJDispatchLite::workerThread, this);
-		++num_of_threads_;
-#if FJDISPATCHLITE_DBG != 0
-		std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
-#endif
-	    }
+	    _strech_workers();
+	    // イベント送信
             cv_.notify_one();
         }
 
@@ -219,28 +239,13 @@ public:
 	// srcfuncをコピー
 	char *srcfunc_copy = new char[srcfunc.size()+1];
 	std::strcpy(srcfunc_copy, srcfunc.c_str());
-
-	auto result = std::make_shared<ResultItem>();
+	// ResultItem
 	fjt_handle_t handle;
-	{
-            std::lock_guard<std::mutex> lock(result_mutex_);
-            handle = ++handle_counter_;
-	    // 結果アイテムの登録と古い結果をキューから削除
-            results_[handle] = result;
-            result_order_.push_back(handle);
-            if (result_order_.size() > FJDISPATCHLITE_MAX_RESULTS) {
-                fjt_handle_t old = result_order_.front();
-                result_order_.pop_front();
-                results_.erase(old);
-            }
-            result_cv_.notify_all();
-        }
+	auto result = std::make_shared<ResultItem>();
+	_new_resultitem( handle, result );
 #if FJDISPATCHLITE_DBG == 1
 	{
-	    uint32_t timeMs;
-	    struct timespec ts;
-	    int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-	    timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+	    uint32_t timeMs = _get_time();
 	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << COLOR_RESET << std::endl;
 	}
 #endif
@@ -250,10 +255,7 @@ public:
 	    auto delay = std::chrono::steady_clock::now();
 	    auto elapsed1 = std::chrono::duration_cast<std::chrono::milliseconds>(delay - start);	    
 	    if (elapsed1.count() > FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC) {
-		uint32_t timeMs;
-		struct timespec ts;
-		int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-		timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+		uint32_t timeMs = _get_time();
 		std::cerr << COLOR_RED << "[" << timeMs << "]:" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is DELAYED. " << elapsed1.count() << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
@@ -262,10 +264,7 @@ public:
 	    auto now = std::chrono::steady_clock::now();
 	    auto elapsed2 = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
 	    if (elapsed2.count() > FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC) {
-		uint32_t timeMs;
-		struct timespec ts;
-		int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-		timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+		uint32_t timeMs = _get_time();
 		std::cerr << COLOR_RED << "[" << timeMs << "]" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is TOO LONG. " << elapsed2.count() << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
@@ -273,13 +272,7 @@ public:
 	    delete[] srcfunc_copy;
 
 	    // 結果の登録
-	    auto it = results_.find(handle);
-            if (it != results_.end()) {
-                it->second->value = ret;
-                it->second->ready = true;
-                it->second->cv.notify_all();
-            }
-
+	    _post_resultitem(handle, ret);
         };
 
 	auto task = std::make_unique<std::packaged_task<void()>>(lambda);
@@ -296,13 +289,8 @@ public:
             inst_info.running = true;
 
 	    // ワーカースレッドを必要に応じて拡張
-	    if (ready_instances_.size() >= num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
-		workers_.emplace_back(&FJDispatchLite::workerThread, this);
-		++num_of_threads_;
-#if FJDISPATCHLITE_DBG != 0
-		std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
-#endif
-	    }
+	    _strech_workers();
+	    // イベント送信
             cv_.notify_one();
         }
 
@@ -316,21 +304,43 @@ public:
      * @param[in] task std::packaged_task
      */
     template <typename T>
-    fjt_handle_t enqueueTask(T* obj, std::packaged_task<void()>&& task) {
+    fjt_handle_t enqueueTask(T* obj, std::packaged_task<void()>&& task, std::string srcfunc, uint32_t srcline) {
 	static_assert(std::is_base_of<FJUnitFrames, T>::value, "T must derive from FJUnitFrames");
-	fjt_handle_t handle;
+	fjt_handle_t handle = getHandle();
+#if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
 	{
-            std::lock_guard<std::mutex> lock(result_mutex_);
-            handle = ++handle_counter_;
-	}
+            std::lock_guard<std::mutex> lock(enqueue_mutex_);
+	    ++enqueues_[srcfunc];
+	    if (enqueue_start_ == 0) {
+		enqueue_start_ = _get_time();
+		enqueue_handle_ = handle;
+	    } else {
+		if ((handle % FJDISPATCHLITE_PROFILE_ENQUEUE_HNUM) == 1) {
+		    uint32_t now = _get_time();
+		    if ((now - enqueue_start_) >= FJDISPATCHLITE_PROFILE_ENQUEUE_MSEC) {
+			std::vector<std::pair<std::string, uint32_t>> vec(enqueues_.begin(), enqueues_.end()); 
+			std::sort(vec.begin(), vec.end(),
+			    [](const auto& a, const auto& b) {
+				return a.second > b.second;
+			    });
+			std::cerr << COLOR_CYAN << "----------[" << now << ":" << enqueue_start_ << "(" << handle - enqueue_handle_ << ")]----------" << std::endl;
+			for (const auto& [key, value] : vec) {
+			    std::cerr << value << ", " << key << std::endl;
+			}
 
+			std::cerr << "--------------------------------" << COLOR_RESET << std::endl;
+			enqueues_.clear();
+			enqueue_start_ = _get_time();
+			enqueue_handle_ = handle;
+		    }
+		}
+	    }
+	}
+#endif
 #if FJDISPATCHLITE_DBG == 1
 	{
-	    uint32_t timeMs;
-	    struct timespec ts;
-	    int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-	    timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
-	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << COLOR_RESET << std::endl;
+	    uint32_t timeMs = _get_time();
+	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << "(" << srcline << ")" << COLOR_RESET << std::endl;
 	}
 #endif
 
@@ -347,13 +357,8 @@ public:
             inst_info.running = true;
 
 	    // ワーカースレッドを必要に応じて拡張
-	    if (ready_instances_.size() >= num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
-		workers_.emplace_back(&FJDispatchLite::workerThread, this);
-		++num_of_threads_;
-#if FJDISPATCHLITE_DBG != 0
-		std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
-#endif
-	    }
+	    _strech_workers();
+	    // イベント送信
             cv_.notify_one();
         }
 
@@ -404,18 +409,13 @@ private:
     };
     
     /**
-     * @brief 各ハンドルごとの実行結果
-     */
-    struct ResultItem {
-	int value; //!< タスクの返り値
-	std::condition_variable cv; //!< タスク完了の状態変数
-	bool ready = false; //!< 実行結果を受け取ったか
-    };
-
-    /**
      * @brief デフォルトコンストラクタ
      */
     FJDispatchLite() : stop_(false), num_of_threads_(FJDISPATCHLITE_DEFAULT_THREADS) {
+#if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
+	enqueue_start_ = 0;
+	enqueue_handle_ = 0;
+#endif
         for(int i=0; i<num_of_threads_; ++i) {
             workers_.emplace_back(&FJDispatchLite::workerThread, this);
         }
@@ -437,7 +437,9 @@ private:
      */
     fjt_handle_t getHandle() {
 	std::lock_guard<std::mutex> lock(result_mutex_);
-	return ++handle_counter_;
+	fjt_handle_t handle = ++handle_counter_;
+	if (handle >= INT64_MAX) handle_counter_ = 1;
+	return handle;
     }
 
     /**
@@ -494,6 +496,31 @@ private:
         }
     }
 
+    /**
+     * @brief ワーカースレッドを必要に応じて拡張
+     */
+    void _strech_workers() {
+	if (ready_instances_.size() >= num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
+	    workers_.emplace_back(&FJDispatchLite::workerThread, this);
+	    ++num_of_threads_;
+#if FJDISPATCHLITE_DBG != 0
+	    std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
+#endif
+	}
+    }
+
+    /**
+     * @brief 32bit epoch time
+     */
+    uint32_t _get_time() {
+	uint32_t timeMs;
+	struct timespec ts;
+	int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+	timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+	return timeMs;
+    }
+
+private:
     std::mutex mutex_; //!< 排他
     std::condition_variable cv_; //!< 状態変数
     bool stop_; //!< 終了宣言変数
@@ -508,6 +535,12 @@ private:
     std::unordered_map<uint64_t, std::shared_ptr<ResultItem>> results_; //!< リザルトテーブル
     std::deque<uint64_t> result_order_;  //! 順序付きでリザルト保存
     uint64_t handle_counter_ = 0; //!< ハンドルカウンタ
+#if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
+    std::mutex enqueue_mutex_; //!< enqueue結果排他
+    std::unordered_map<std::string, uint32_t> enqueues_; //!< enqueue結果テーブル
+    uint32_t enqueue_start_; //!< ロギング開始epoch
+    fjt_handle_t enqueue_handle_; //!< ロギング開始ハンドル
+#endif
 };
 
 #endif
