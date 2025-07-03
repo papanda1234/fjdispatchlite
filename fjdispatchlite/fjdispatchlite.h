@@ -303,8 +303,13 @@ public:
      * @param[in] obj FJUnitFramesのポインタ
      * @param[in] task std::packaged_task
      */
+#if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
     template <typename T>
     fjt_handle_t enqueueTask(T* obj, std::packaged_task<void()>&& task, std::string srcfunc, uint32_t srcline) {
+#else
+    template <typename T>
+    fjt_handle_t enqueueTask(T* obj, std::packaged_task<void()>&& task) {
+#endif
 	static_assert(std::is_base_of<FJUnitFrames, T>::value, "T must derive from FJUnitFrames");
 	fjt_handle_t handle = getHandle();
 #if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
@@ -336,13 +341,13 @@ public:
 		}
 	    }
 	}
-#endif
 #if FJDISPATCHLITE_DBG == 1
 	{
 	    uint32_t timeMs = _get_time();
 	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << "(" << srcline << ")" << COLOR_RESET << std::endl;
 	}
-#endif
+#endif //DBG
+#endif //ENQUEUE
 
 	// インスタンスのタスクキューに所有権を移動
         std::unique_lock<std::mutex> lock(mutex_);
