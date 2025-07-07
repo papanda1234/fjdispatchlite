@@ -548,5 +548,5 @@ private:
 #endif
 };
 
-#endif
+#endif //__FJDISPATCHLITE_H__
 
