@@ -1,3 +1,25 @@
+/**
+ * Copyright 2025 FJD
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * @file fjsharedmem.h
+ * @author FJD
+ * @date 2025.7.7
+ */
+
 #ifndef __FJSHAREDMEM_H__
 #define __FJSHAREDMEM_H__
 
@@ -16,19 +38,28 @@
 
 #include "fjfixvector.h"
 
-#define C_FJNT_LISTEN_MAX 256
-#define C_FJNT_QUEUE_MAX 512
+#define C_FJNT_LISTEN_MAX 256 //!< リスナーテーブル最大数
+#define C_FJNT_QUEUE_MAX 512 //!< メッセージキュー最大数
 
-typedef uint32_t fjt_msg_t;
+typedef uint32_t fjt_msg_t; //!< メッセージID型
 
+/**
+ * @brief メッセージ通知付き共有メモリ
+ */
 class FJSharedMem {
 public:
+	/**
+	 * @brief メール形式
+	 */
     struct mailAtom {
         fjt_msg_t msg_;
         FJSharedMem* obj_;
         pid_t pid_;
     };
 
+	/**
+	 * @brief 管理領域
+	 */
     struct SharedRegion {
 		uint32_t initialized_;
         pthread_mutex_t mutex_;
@@ -39,6 +70,11 @@ public:
         mailAtom queue_[C_FJNT_QUEUE_MAX];
     };
 
+	/**
+	 * @brief コンストラクタ
+	 * @param[in] shm_name 共有メモリの名前。必ず'/'で始めること。
+	 * @param[in] extra_size 拡張領域のサイズ(初期化後get()で取得可能)
+	 */
     FJSharedMem(const std::string& shm_name, size_t extra_size)
         : pid_(getpid()), shm_name_(shm_name), full_ptr_(nullptr), user_ptr_(nullptr)
     {
@@ -78,6 +114,9 @@ public:
 		pthread_mutex_unlock(&shared_region_->mutex_);
     }
 
+	/**
+	 * @brief デストラクタ
+	 */
     virtual ~FJSharedMem() {
         if (full_ptr_) {
 			bool is_unlink = false;
@@ -122,6 +161,9 @@ public:
 		}
     }
 
+	/**
+	 * @brief 拡張領域のポインタ
+	 */
 	void *get() {
 		void *ptr = nullptr;
 		if (p_refcount_ > 0) {
@@ -132,6 +174,12 @@ public:
 		return ptr;
 	}
 
+	/**
+	 * @brief 受け取りたい通知を設定
+	 * @note 重複チェックは行わないため注意。
+	 * @param[in] obj リスナーのオブジェクト(通常は自分自身)
+	 * @param[in] msg メッセージID
+	 */
     bool addListen(FJSharedMem* obj, fjt_msg_t msg) {
         if (!obj || msg == 0) return false;
         pthread_mutex_lock(&shared_region_->mutex_);
@@ -145,6 +193,11 @@ public:
         return true;
     }
 
+	/**
+	 * @brief 通知を送信
+	 * @param[in] obj センダーのオブジェクト(通常は自分自身)
+	 * @param[in] msg メッセージID
+	 */
     bool notify(FJSharedMem* obj, fjt_msg_t msg) {
         if (!obj || msg == 0) return false;
         pthread_mutex_lock(&shared_region_->mutex_);
@@ -172,13 +225,19 @@ public:
         return true;
     }
 
+	/**
+	 * @brief 通知を受け取る関数
+	 */
     virtual void update(FJSharedMem* obj, fjt_msg_t msg) {};
 
 protected:
-    void* user_ptr_;
-    pid_t pid_;
+    void* user_ptr_; //!< 拡張領域のポインタ
+    pid_t pid_; //!< プロセスID
 
 private:
+	/**
+	 * @brief 管理領域初期化
+	 */
     void initSharedRegion() {
         static bool initialized = false;
         if (initialized) return;
@@ -200,6 +259,10 @@ private:
 		shared_region_->initialized_ = 0;
     }
 
+	/**
+	 * @brief ワーカースレッド
+	 * @note 1プロセスにつき1つ
+	 */
     void workerThread() {
         while (p_refcount_ > 0) {
             pthread_mutex_lock(&shared_region_->mutex_);
