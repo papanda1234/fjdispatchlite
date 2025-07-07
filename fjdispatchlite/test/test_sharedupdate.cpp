@@ -7,10 +7,11 @@ class Receiver : public FJSharedMem {
 public:
     Receiver(const std::string& name) : FJSharedMem(name, 0) {
         addListen(this, 12345); // 受信するmsgを登録
+		std::cerr << "listner" << this << std::endl;
     }
 
-    void update(FJSharedMem*, fjt_msg_t msg) override {
-        std::cout << "Received notification: msg = " << msg << "\n";
+    void update(FJSharedMem*obj, fjt_msg_t msg) override {
+        std::cout << "Received " << obj << " ,notification: msg = " << msg << "\n";
     }
 };
 
