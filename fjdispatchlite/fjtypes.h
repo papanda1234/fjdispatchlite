@@ -19,6 +19,7 @@
 
 #ifndef DOXYGEN_SKIP_THIS
 #include <stdint.h>
+#include <chrono>
 #endif
 
 #ifndef __FJT_TIME__
@@ -29,6 +30,18 @@ typedef std::chrono::steady_clock::time_point fjt_time_t; //!< 時刻型
 #ifndef __FJT_HANDLE_T__
 #define __FJT_HANDLE_T__
 typedef uint64_t fjt_handle_t; //!< ハンドル型
+#endif
+
+#ifndef __FJT_MSG_T__
+#define __FJT_MSG_T__
+typedef uint32_t fjt_msg_t; //!< メッセージID型
+#endif
+
+#ifndef COLOR_RED
+#define COLOR_RED     "\033[31m"
+#define COLOR_YELLOW  "\033[33m"
+#define COLOR_CYAN    "\033[36m"
+#define COLOR_RESET   "\033[0m"
 #endif
 
 #endif

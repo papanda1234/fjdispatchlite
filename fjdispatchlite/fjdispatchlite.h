@@ -54,10 +54,6 @@
 #define FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC (200) //!< postQueueしてから実行されるまでの遅延許容値(msec)
 #define FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC (200) //!< メソッド実行にかかる時間の許容値(msec)
 
-#define COLOR_RED     "\033[31m"
-#define COLOR_CYAN    "\033[36m"
-#define COLOR_RESET   "\033[0m"
-
 // 前方参照
 class FJTimerLite;
 
@@ -437,6 +433,17 @@ private:
     FJDispatchLite& operator=(const FJDispatchLite&) = delete;
 
     /**
+     * @brief 32bit epoch time(JKDispatchLite)
+     */
+    static uint32_t _get_time() {
+	uint32_t timeMs;
+	struct timespec ts;
+	int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+	timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+	return timeMs;
+    }
+
+    /**
      * @brief 新しいハンドルを確保
      * @return 新しいハンドル
      */
@@ -512,17 +519,6 @@ private:
 	    std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
 #endif
 	}
-    }
-
-    /**
-     * @brief 32bit epoch time
-     */
-    uint32_t _get_time() {
-	uint32_t timeMs;
-	struct timespec ts;
-	int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-	timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
-	return timeMs;
     }
 
 private:

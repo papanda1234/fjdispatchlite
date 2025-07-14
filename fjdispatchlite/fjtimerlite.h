@@ -17,7 +17,7 @@
 /**
  * @file fjtimerlite.h
  * @author FJD
- * @date 2025.5.29
+ * @date 2025.7.14
  */
 #ifndef __FJTIMERLITE_H__
 #define __FJTIMERLITE_H__
@@ -36,7 +36,7 @@
 #define FJTIMERLITE_MIN_TICK_MSEC (15) //!< 最小ウェイト(msec)
 #define FJTIMERLITE_MAX_TICK_MSEC (2000) //!< アイドル時ウェイト(msec)
 
-#define FJTIMERLITE_PROFILE_DBG (1) //!< メソッド実行プロファイラ
+#define FJTIMERLITE_PROFILE_DBG (0) //!< メソッド実行プロファイラ
 
 // 前方参照
 class FJDispatchLite;
@@ -53,6 +53,17 @@ public:
     static FJTimerLite* GetInstance() {
         static FJTimerLite instance;
         return &instance;
+    }
+
+    /**
+     * @brief 32bit epoch time(JKTimerLite)
+     */
+    static uint32_t _get_time() {
+	uint32_t timeMs;
+	struct timespec ts;
+	int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
+	timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
+	return timeMs;
     }
 
     /**
