@@ -17,7 +17,7 @@
 /**
  * @file fjsharedmem.h
  * @author FJD
- * @date 2025.7.7
+ * @date 2025.7.16
  */
 
 #ifndef __FJSHAREDMEM_H__
@@ -37,9 +37,13 @@
 
 #include "fjtypes.h"
 #include "fjfixvector.h"
+#include "fjfixmap.h"
 
 #define C_FJNT_LISTEN_MAX 256 //!< リスナーテーブル最大数
 #define C_FJNT_QUEUE_MAX 512 //!< メッセージキュー最大数
+#define C_FJNT_PROCESS_MAX 50 //!< 共有メモリを利用するプロセスの最大数
+
+#define C_FJNT_SHAREDREGION_NAME "/fjsharedmem" //!< 管理領域の名前
 
 #define FJSHAREDMEM_DBG (0) //!< for debug.
 
@@ -58,19 +62,31 @@ public:
         pid_t pid_;
     };
 
-    inline void mailAtomInit(struct mailAtom* m) { m->msg_ = 0; m->obj_ = nullptr; m->pid_ = 0; }
+    /**
+     * @brief プロセスごとの管理領域
+     */     
+    struct proAtom {
+        pthread_mutex_t mutex_;
+        pthread_cond_t cond_;
+	uint32_t refcount_;
+	pthread_t worker_; //!< ワーカースレッド
+	bool running_; //!< ワーカー動作
+	bool worker_done_; //!< ワーカースレッド終了フラグ
+    };
 
     /**
-     * @brief 管理領域
+     * @brief 全体の管理領域
      */
     struct SharedRegion {
 	uint32_t initialized_;
-        pthread_mutex_t mutex_;
-        pthread_cond_t cond_;
-	uint32_t lptr_;
-	uint32_t qptr_;
+	pthread_mutex_t mutex_;
+
+	proAtom protbl_[C_FJNT_PROCESS_MAX];
+	uint32_t proptr_;
         mailAtom listen_[C_FJNT_LISTEN_MAX];
+	uint32_t lptr_;
         mailAtom queue_[C_FJNT_QUEUE_MAX];
+	uint32_t qptr_;
     };
 
     /**
@@ -79,32 +95,46 @@ public:
      * @param[in] extra_size 拡張領域のサイズ(初期化後get()で取得可能)
      */
     FJSharedMem(const std::string& shm_name, size_t extra_size, const char *srcfunc = nullptr, std::vector<fjt_msg_t> list = {})
-        : pid_(getpid()), shm_name_(shm_name), full_ptr_(nullptr), user_ptr_(nullptr), worker_done_(false), needworker_(false) 
+        : pid_(getpid()), shm_name_(shm_name), shared_ptr_(nullptr), user_ptr_(nullptr), extra_size_(extra_size), needworker_(false) 
     {
 	if (srcfunc) {
 	    srcfunc_ = srcfunc;
 	}
-        total_size_ = sizeof(SharedRegion) + extra_size;
         bool is_create = false;
-        int fd = shm_open(shm_name_.c_str(), O_RDWR, 0666);
+        int fd = shm_open(C_FJNT_SHAREDREGION_NAME, O_RDWR, 0666);
+	if (fd < 0) {
+	    // まだ存在しない
+            fd = shm_open(C_FJNT_SHAREDREGION_NAME, O_CREAT | O_RDWR, 0666);
+            if (fd < 0) { perror("shm_open"); exit(1); }
+            if (ftruncate(fd, sizeof(SharedRegion)) < 0) { perror("shm_ftruncate"); exit(1); }
+	    is_create = true;
+#if FJSHAREDMEM_DBG == 1
+	    std::cerr << COLOR_CYAN << "INFO: " << srcfunc_ << "(pid:" << pid_ << "): created sharedmem[" << C_FJNT_SHAREDREGION_NAME << "]" << COLOR_RESET << std::endl;
+#endif
+	}
+	// mapはmaster/slave共通
+        shared_ptr_ = mmap(nullptr, sizeof(SharedRegion), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (shared_ptr_ == MAP_FAILED) { perror("shm_mmap"); exit(1); }
+        shared_region_ = reinterpret_cast<SharedRegion*>(shared_ptr_);
+	close(fd);
+
+	// 個別の領域
+        fd = shm_open(shm_name_.c_str(), O_RDWR, 0666);
         if (fd < 0) {
 	    // まだ存在しない
             fd = shm_open(shm_name_.c_str(), O_CREAT | O_RDWR, 0666);
-            if (fd < 0) { perror("shm_open"); exit(1); }
-            if (ftruncate(fd, total_size_) < 0) { perror("ftruncate"); exit(1); }
-	    is_create = true;
+            if (fd < 0) { perror("ext_open"); exit(1); }
+            if (ftruncate(fd, extra_size_) < 0) { perror("ext_ftruncate"); exit(1); }
 #if FJSHAREDMEM_DBG == 1
-	    std::cerr << COLOR_CYAN << "INFO: " << srcfunc_ << "(pid:" << pid_ << "): created sharedmem[" << shm_name_ << "]" << COLOR_RESET << std::endl;
+	    std::cerr << COLOR_CYAN << "INFO: " << srcfunc_ << "(pid:" << pid_ << "): created extmem[" << shm_name_ << "]" << COLOR_RESET << std::endl;
 #endif
         }
 
 	// mapはmaster/slave共通
-        full_ptr_ = mmap(nullptr, total_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (full_ptr_ == MAP_FAILED) { perror("mmap"); exit(1); }
+        user_ptr_ = mmap(nullptr, extra_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (user_ptr_ == MAP_FAILED) { perror("ext_mmap"); exit(1); }
 	close(fd);
 
-        shared_region_ = reinterpret_cast<SharedRegion*>(full_ptr_);
-        user_ptr_ = reinterpret_cast<void*>((char*)full_ptr_ + sizeof(SharedRegion));
         if (is_create) {
 	    // 全プロセスで初回のみ
             initSharedRegion();
@@ -114,7 +144,6 @@ public:
 	    static uint32_t timeoutMs = 100;
 	    for (; i < timeoutMs && shared_region_->initialized_ == 0; i++) {
 		usleep(1000);
-
 	    }
 #if FJSHAREDMEM_DBG == 1
 	    if (i == timeoutMs) {
@@ -127,12 +156,24 @@ public:
 	// 通知の登録
 	int regi = _addListen(this, list);
 	if (regi > 0) {
-	    // 通知が必要なインスタンスが1プロセス中で初めて生成された場合、ワーカー生成
+	    // 通知が必要なインスタンスの場合ワーカーが必要
 	    needworker_ = true;
-	    ++p_refcount_; //!< 1プロセスあたりの参照カウント+1
-	    if (p_refcount_ == 1) {
-		worker_done_ = false;
-		pthread_create(&worker_, nullptr, &FJSharedMem::workerThreadWrapper, this);
+	    FJFixMap<proAtom> protbl((char*)&(shared_region_->protbl_), sizeof(proAtom)*C_FJNT_PROCESS_MAX, shared_region_->proptr_);
+	    proAtom *p = protbl.find(pid_);
+	    if (p == nullptr) {
+		// 新規
+		p = protbl.insert(pid_);
+		if (p != nullptr) {
+		    _proAtomInit(p);
+		}
+	    }
+
+	    p->refcount_ = p->refcount_ + 1; //!< 1プロセスあたりの参照カウント+1
+	    if (p->refcount_ == 1) {
+		// このプロセスで初回のみスレッド起動
+		p->running_ = true;
+		p->worker_done_ = false;
+		pthread_create(&p->worker_, nullptr, &FJSharedMem::workerThreadWrapper, this);
 #if FJSHAREDMEM_DBG == 1
 		std::cerr << COLOR_CYAN << "INFO: " << srcfunc_ << "(pid:" << pid_ << "): created worker thread" << COLOR_RESET << std::endl;
 #endif
@@ -147,31 +188,43 @@ public:
      * @brief デストラクタ
      */
     virtual ~FJSharedMem() {
-        if (full_ptr_) {
-	    bool is_stopworker = false;
+        if (user_ptr_) {
 	    bool is_unlink = false;
 	    pthread_mutex_lock(&shared_region_->mutex_);
 	    if (needworker_) {
-		--p_refcount_; //!< 1プロセス中の参照カウント--
-		if (p_refcount_ == 0) {
-		    is_stopworker = true;
-		    pthread_cond_broadcast(&shared_region_->cond_);
+		FJFixMap<proAtom> protbl((char*)&(shared_region_->protbl_), sizeof(proAtom)*C_FJNT_PROCESS_MAX, shared_region_->proptr_);
+		proAtom *p = protbl.find(pid_);
+		if (p != nullptr) {
+		    p->refcount_ = p->refcount_ - 1; //!< 1プロセス中の参照カウント--
+		    if (p->refcount_ == 0) {
+			p->running_ = false;
+			pthread_mutex_lock(&p->mutex_);
+			pthread_cond_broadcast(&p->cond_);
+			pthread_mutex_unlock(&p->mutex_);
+
+			// スレッド終了までspinlock
+			static uint32_t timeoutMs = 100;
+			uint32_t i = 0;
+			do {
+			    pthread_mutex_lock(&p->mutex_);
+			    if (p->worker_done_ == true) {
+				pthread_join(p->worker_, NULL);
+				pthread_mutex_unlock(&p->mutex_);
+				break;
+			    }
+			    usleep(1000);
+			} while (i++ < timeoutMs);
+			if (i == timeoutMs) {
+			    std::cerr << COLOR_RED << "WARNING: " << srcfunc_ << "(pid:" << pid_ << "): thread join timeout." << COLOR_RESET << std::endl;
+			}
+			_proAtomDestroy(p);
+			protbl.unset(pid_); // 削除
+		    }
 		}
 	    }
 	    pthread_mutex_unlock(&shared_region_->mutex_);
-
-	    if (is_stopworker) {
-		// スレッド終了までspinlock
-		static uint32_t timeoutMs = 100;
-		uint32_t i = 0;
-		for (; i < timeoutMs && worker_done_ == false; ++i) {
-		    usleep(1000);
-		}
-		if (i == timeoutMs) {
-		    std::cerr << COLOR_RED << "WARNING: " << srcfunc_ << "(pid:" << pid_ << "): thread join timeout." << COLOR_RESET << std::endl;
-		}
-		pthread_join(worker_, NULL);
-	    }
+	    
+	    usleep(0);
 
 	    pthread_mutex_lock(&shared_region_->mutex_);
 	    if (needworker_) {
@@ -179,27 +232,25 @@ public:
 		for (int32_t i = 0; i < shared_region_->qptr_; ++i) {
 		    mailAtom *m = queue.at(i);
 		    if (m->obj_ == this) {
-			mailAtomInit(m);
+			_mailAtomInit(m);
 		    }
 		}
 		queue.sort([](const mailAtom& a, const mailAtom& b) { return a.msg_ < b.msg_; });		
-		while (queue.length() > 0 && queue.at(0)->msg_ == 0) {
+		while (queue.size() > 0 && queue.at(0)->msg_ == 0) {
 		    queue.splice(0, 1);
 		}
-		shared_region_->qptr_ = queue.length();
 
 		FJFixVector<mailAtom> listen((char*)&(shared_region_->listen_), sizeof(mailAtom)*C_FJNT_LISTEN_MAX, shared_region_->lptr_);
 		for (int32_t i = 0; i < shared_region_->lptr_; ++i) {
 		    mailAtom *m = listen.at(i);
 		    if (m->obj_ == this) {
-			mailAtomInit(m);
+			_mailAtomInit(m);
 		    }
 		}
 		listen.sort([](const mailAtom& a, const mailAtom& b) { return a.msg_ < b.msg_; });		
-		while (listen.length() > 0 && listen.at(0)->msg_ == 0) {
+		while (listen.size() > 0 && listen.at(0)->msg_ == 0) {
 		    listen.splice(0, 1);
 		}
-		shared_region_->lptr_ = listen.length();
 	    }
 	    --(shared_region_->initialized_); //!< 全プロセス中の合計インスタンス数--
 	    if (shared_region_->initialized_ == 0) {
@@ -207,9 +258,11 @@ public:
 	    }
 	    pthread_mutex_unlock(&shared_region_->mutex_);
 
-	    munmap(full_ptr_, total_size_);
+	    munmap(user_ptr_, extra_size_);
+	    munmap(shared_ptr_, sizeof(SharedRegion));
 	    if (is_unlink) {
 		shm_unlink(shm_name_.c_str());
+		shm_unlink(C_FJNT_SHAREDREGION_NAME);
 	    }
 	}
     }
@@ -220,11 +273,9 @@ public:
      */
     void *_get() {
 	void *ptr = nullptr;
-	if (p_refcount_ > 0) {
-	    pthread_mutex_lock(&shared_region_->mutex_);
-	    ptr = user_ptr_;
-	    pthread_mutex_unlock(&shared_region_->mutex_);
-	}
+	pthread_mutex_lock(&shared_region_->mutex_);
+	ptr = user_ptr_;
+	pthread_mutex_unlock(&shared_region_->mutex_);
 	return ptr;
     }
 
@@ -234,7 +285,7 @@ public:
      * @param[in] msg メッセージID
      */
     bool addListen(FJSharedMem* obj, fjt_msg_t msg) {
-        if (!obj) return false;
+        if (!obj || !msg) return false;
 
         pthread_mutex_lock(&shared_region_->mutex_);
 	if (needworker_ == false) {
@@ -273,7 +324,10 @@ public:
      */
     bool _notify(FJSharedMem* from, fjt_msg_t msg) {
         if (!from) return false;
+
 	uint32_t msgcount = 0;
+	std::map<uint32_t,uint32_t> pids;
+
 	FJFixVector<mailAtom> queue((char*)&(shared_region_->queue_), sizeof(mailAtom)*C_FJNT_QUEUE_MAX, shared_region_->qptr_);
 	FJFixVector<mailAtom> listen((char*)&(shared_region_->listen_), sizeof(mailAtom)*C_FJNT_LISTEN_MAX, shared_region_->lptr_);
 
@@ -312,15 +366,24 @@ public:
 	    std::cerr << COLOR_CYAN << "INFO: " << srcfunc_ << "(pid:" << pid_ << " obj:" << from << "): send msg[" << msg << "] to:" << to->obj_ << COLOR_RESET << std::endl;
 #endif
 	    if (queue.push_back(*to) == true) {
-		shared_region_->qptr_ = queue.length();
 		++msgcount;
+		pids[to->pid_] = 1;
 	    } else {
 		std::cerr << COLOR_RED << "ERROR: " << srcfunc_ << "(pid:" << pid_ << " obj:" << from << "): msg[" << msg << "] to:" << to->obj_ << " queue is full." << COLOR_RESET << std::endl;
 	    }
 	}
 	// ブロードキャスト
 	if (msgcount > 0) {
-	    pthread_cond_broadcast(&shared_region_->cond_);
+	    FJFixMap<proAtom> protbl((char*)&(shared_region_->protbl_), sizeof(proAtom)*C_FJNT_PROCESS_MAX, shared_region_->proptr_);
+	    std::map<uint32_t,uint32_t>::iterator it;
+	    for (it = pids.begin(); it != pids.end(); ++it) {
+		proAtom *p = protbl.find(it->first);
+		if (p != nullptr && p->running_ == true && p->worker_done_ == false) {
+		    pthread_mutex_lock(&p->mutex_);
+		    pthread_cond_broadcast(&p->cond_);
+		    pthread_mutex_unlock(&p->mutex_);
+		}
+	    }
 	}
         return true;
     }
@@ -372,6 +435,45 @@ protected:
     }
 
 private:
+
+    /**
+     * @brief mailAtom初期化
+     * @param[in] m ポインタ
+     */
+    void _mailAtomInit(struct mailAtom* m) {
+	m->msg_ = 0;
+	m->obj_ = nullptr;
+	m->pid_ = 0;
+    }
+
+    /**
+     * @brief proAtom初期化
+     * @param[in] p ポインタ
+     */
+    void _proAtomInit(struct proAtom *p) {
+        pthread_mutexattr_t mattr;
+        pthread_condattr_t cattr;
+        pthread_mutexattr_init(&mattr);
+        pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+        pthread_condattr_init(&cattr);
+        pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
+
+	// 1プロセスで共有する排他
+        pthread_mutex_init(&p->mutex_, &mattr);
+	// 1プロセスで共有する状態変数
+        pthread_cond_init(&p->cond_, &cattr);
+	// ワーカースレッド関係初期化
+	p->refcount_ = 0;
+	p->worker_ = 0;
+	p->running_ = true;
+	p->worker_done_ = false;
+    };
+
+    void _proAtomDestroy(struct proAtom *p) {
+	pthread_mutex_destroy(&p->mutex_);
+	pthread_cond_destroy(&p->cond_);
+    }
+
     /**
      * @brief 管理領域初期化
      */
@@ -380,17 +482,13 @@ private:
         if (initialized) return;
         initialized = true;
 
+	// 全プロセスで共有する排他
         pthread_mutexattr_t mattr;
-        pthread_condattr_t cattr;
         pthread_mutexattr_init(&mattr);
         pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
-        pthread_condattr_init(&cattr);
-        pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
-
-	// 全プロセスで共有する排他
         pthread_mutex_init(&shared_region_->mutex_, &mattr);
-	// 全プロセスで共有する状態変数
-        pthread_cond_init(&shared_region_->cond_, &cattr);
+	// プロセス管理テーブル初期化
+	shared_region_->proptr_ = 0;
 	// Listen配列の初期化
         memset(shared_region_->listen_, 0, sizeof(shared_region_->listen_));
         shared_region_->lptr_ = 0;
@@ -439,7 +537,6 @@ private:
 		}
 	    }
 	}
-	shared_region_->lptr_ = listen.length();
 	listen.sort([](const mailAtom& a, const mailAtom& b) { return a.msg_ < b.msg_; });		
 	return regi;
     }
@@ -459,13 +556,23 @@ private:
      * @note 1プロセスにつき1つ
      */
     void workerThread() {
+	pthread_setname_np(pthread_self(), "shm_work");
 
-        while (p_refcount_ > 0) {
-            pthread_mutex_lock(&shared_region_->mutex_);
-            pthread_cond_wait(&shared_region_->cond_, &shared_region_->mutex_);
-	    if (p_refcount_ == 0) {
+	pthread_mutex_lock(&shared_region_->mutex_);
+	FJFixMap<proAtom> protbl((char*)&(shared_region_->protbl_), sizeof(proAtom)*C_FJNT_PROCESS_MAX, shared_region_->proptr_);
+	proAtom *p = protbl.find(pid_);
+	pthread_mutex_unlock(&shared_region_->mutex_);
+
+        while (p != nullptr && p->running_) {
+            pthread_mutex_lock(&p->mutex_);
+            pthread_cond_wait(&p->cond_, &p->mutex_);
+	    if (p->running_ == false) {
+		pthread_mutex_unlock(&p->mutex_);
 		break;
 	    }
+	    pthread_mutex_unlock(&p->mutex_);
+
+	    pthread_mutex_lock(&shared_region_->mutex_);
 	    FJFixVector<mailAtom> queue((char*)&(shared_region_->queue_), sizeof(mailAtom)*C_FJNT_QUEUE_MAX, shared_region_->qptr_);
             std::vector<mailAtom> locals;
 	    // queue_を0からqptr_までループするfor文
@@ -474,15 +581,15 @@ private:
 		if (to->msg_ != 0 && to->obj_ != nullptr && to->pid_ == pid_) {
 		    // 自分のプロセス内のメッセージに限る
 		    locals.push_back(*to);
-		    mailAtomInit(to);
+		    _mailAtomInit(to);
 		}
 	    }
 	    queue.sort([](const mailAtom& a, const mailAtom& b) { return a.msg_ < b.msg_; });		
-	    while (queue.length() > 0 && queue.at(0)->msg_ == 0) {
+	    while (queue.size() > 0 && queue.at(0)->msg_ == 0) {
 		queue.splice(0, 1);
 	    }
-	    shared_region_->qptr_ = queue.length();
             pthread_mutex_unlock(&shared_region_->mutex_);
+
             for (auto& mail : locals) {
 #if FJSHAREDMEM_DBG == 1
 		std::cerr << COLOR_YELLOW << "INFO: " << srcfunc_ << "(pid:" << pid_ << " obj:" << this << "): received msg[" << mail.msg_ << "] from " << mail.obj_ << COLOR_RESET << std::endl;
@@ -497,20 +604,17 @@ private:
 #if FJSHAREDMEM_DBG == 1
 	std::cerr << COLOR_RED << "pid:" << pid_ << "'s workerThread ended." << COLOR_RESET << std::endl;
 #endif	
-	worker_done_ = true;
+	pthread_mutex_lock(&p->mutex_);
+	p->worker_done_ = true;
+	pthread_mutex_unlock(&p->mutex_);
     }
 
     std::string shm_name_; //!< 共有メモリの名前
     std::string srcfunc_; //!< 共有メモリを作成した関数名
-    void* full_ptr_; //!< 共有メモリの先頭
+    void* shared_ptr_; //!< 管理領域の先頭
     SharedRegion* shared_region_; //!< 管理構造体
-    size_t total_size_; //!< 総サイズ
-
+    size_t extra_size_; //!< 拡張サイズ
     bool needworker_; ////!< ワーカースレッド必要フラグ
-    pthread_t worker_; //!< ワーカースレッド
-    bool worker_done_; //!< ワーカースレッド終了フラグ
-
-    static int p_refcount_; //!< プロセス内でのFJSharedMemインスタンスの数
 };
 
 #endif //__FJSHAREDMEM_H__
