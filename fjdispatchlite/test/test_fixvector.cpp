@@ -9,7 +9,8 @@ struct ListAtom {
 int main() {
     char buf[1000];
 
-    FJFixVector<ListAtom> list(buf, sizeof(buf));
+    size_t l1 = 0;
+    FJFixVector<ListAtom> list(buf, sizeof(buf), l1);
 
     ListAtom obj1 = {11, 1234};
     list.push_back(obj1);
@@ -23,7 +24,8 @@ int main() {
     std::cout << "Length: " << list.length() << std::endl;
 
 	////// list2 /////
-    FJFixVector<ListAtom> list2(buf, sizeof(buf), list.length()); // 同一領域を参照
+    l1 = list.size();
+    FJFixVector<ListAtom> list2(buf, sizeof(buf), l1); // 同一領域を参照
 
     for (size_t i = 0; i < list2.length(); ++i) {
         ListAtom* p = list2.at(i);

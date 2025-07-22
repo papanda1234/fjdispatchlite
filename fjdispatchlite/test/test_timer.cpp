@@ -42,9 +42,15 @@ int main() {
     FJDispatchLite* dispatch = FJDispatchLite::GetInstance();
     FJTestHold *C1 = new FJTestHold();
 
+    std::cerr << "START" << std::endl;
+
     fjt_handle_t t1 = timer->createTimer(C1, &FJTestHold::onTimer, 1000, __FUNCTION__, __LINE__);
 
-    std::this_thread::sleep_for(std::chrono::seconds(5));  
+    std::cerr << "RUN" << std::endl;
+
+    sleep(5);
+
+    std::cerr << "REMOVE" << std::endl;
 
     FJTimerLite::GetInstance()->removeTimer(t1);
 

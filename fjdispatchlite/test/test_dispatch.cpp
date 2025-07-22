@@ -18,7 +18,7 @@ int FJTestCall::onCall(uint32_t msg, void* buf, uint32_t len)
 {
     std::string s(static_cast<char *>(buf), len);
     std::cout << "onCall called for instance " << this << ": " << s << ": " << msg << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 擬似処理時間
+    sleep(1); // 擬似処理時間
     return -55;
 }
 
@@ -41,7 +41,7 @@ int FJTestHold::onHold(uint32_t msg, void* buf, uint32_t len)
 {
     std::string s(static_cast<char *>(buf), len);
     std::cout << "onHold called for instance " << this << ": " << s << ": " << msg << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 擬似処理時間
+    sleep(1); // 擬似処理時間
     return 112;
 }
 
@@ -90,7 +90,7 @@ int main() {
 	std::cout << "B1_6 TIMEOUT" << std::endl;
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(5));  
+    sleep(5);
 
     std::cout << "DELETE" << std::endl;
     delete A1;
