@@ -69,7 +69,7 @@ public:
     struct proAtom {
         pthread_mutex_t mutex_;
         pthread_cond_t cond_;
-	uint32_t refcount_;
+	size_t refcount_;
 	pthread_t worker_; //!< ワーカースレッド
 	bool running_; //!< ワーカー動作
 	bool worker_done_; //!< ワーカースレッド終了フラグ
@@ -83,11 +83,11 @@ public:
 	pthread_mutex_t mutex_;
 
 	proAtom protbl_[C_FJNT_PROCESS_MAX];
-	uint32_t proptr_;
+	size_t proptr_;
         mailAtom listen_[C_FJNT_LISTEN_MAX];
-	uint32_t lptr_;
+	size_t lptr_;
         mailAtom queue_[C_FJNT_QUEUE_MAX];
-	uint32_t qptr_;
+	size_t qptr_;
     };
 
     /**

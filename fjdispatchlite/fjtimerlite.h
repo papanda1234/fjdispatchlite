@@ -24,11 +24,8 @@
 
 #ifndef DOXYGEN_SKIP_THIS
 #include <iostream>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <atomic>
-#include <chrono>
+#include <pthread.h>
 #endif
 
 #include "fjtypes.h"
@@ -56,30 +53,22 @@ public:
     }
 
     /**
-     * @brief 32bit epoch time(JKTimerLite)
-     */
-    static uint32_t _get_time() {
-	uint32_t timeMs;
-	struct timespec ts;
-	int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-	timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
-	return timeMs;
-    }
-
-    /**
      * @brief デストラクタ
      */
     ~FJTimerLite() {
 	{
-	    std::unique_lock<std::mutex> lock(mutex_);
+	    pthread_mutex_lock(&mutex_);
 	    timers_.clear();
 	    base_interval_msec_ = FJTIMERLITE_MAX_TICK_MSEC;
 	    stop_ = true;
+	    pthread_cond_broadcast(&cv_);
+	    pthread_mutex_unlock(&mutex_);
 	}
-	cond_var_.notify_one();
-	if (worker_.joinable()) {
-	    worker_.join();
-	}
+
+        pthread_join(worker_, nullptr);
+
+        pthread_mutex_destroy(&mutex_);
+        pthread_cond_destroy(&cv_);
     }
 
     /**
@@ -89,14 +78,16 @@ public:
      * @retval [true] 設定成功
      * @retval [false] 範囲外
      */
-    bool setBaseIntervalMs(uint16_t msec)
+    bool setBaseIntervalMs(int64_t msec)
     {
-        std::unique_lock<std::mutex> lock(mutex_);
+	pthread_mutex_lock(&mutex_);
 	if (msec >= FJTIMERLITE_MIN_TICK_MSEC && msec <= FJTIMERLITE_MAX_TICK_MSEC) {
 	    base_interval_msec_ = msec;
-	    cond_var_.notify_one();
+	    pthread_cond_broadcast(&cv_);
+	    pthread_mutex_unlock(&mutex_);
 	    return true;
 	}
+	pthread_mutex_unlock(&mutex_);
 	return false;
     }
 
@@ -116,16 +107,18 @@ public:
 
 	if (interval_msec < FJTIMERLITE_MIN_TICK_MSEC) return 0;
 
-        std::unique_lock<std::mutex> lock(mutex_);
+	pthread_mutex_lock(&mutex_);
+
 	fjt_handle_t handle = FJDispatchLite::GetInstance()->getHandle();
 	auto cb = std::bind(mf, obj, std::placeholders::_1, std::placeholders::_2);
 	timers_.emplace(handle, TimerInfo(obj, cb, interval_msec, srcfunc, srcline));
 
 	if (base_interval_msec_ > (interval_msec / 5)) {
 	    base_interval_msec_ = interval_msec / 5;
-	    cond_var_.notify_one();
+	    pthread_cond_broadcast(&cv_);
 	}
 
+	pthread_mutex_unlock(&mutex_);
 	return handle;
     }
 
@@ -137,18 +130,22 @@ public:
      * @retval [false] 存在しないハンドル
      */
     bool removeTimer(fjt_handle_t handle) {
-        std::unique_lock<std::mutex> lock(mutex_);
+	pthread_mutex_lock(&mutex_);
+
 	if (timers_.find(handle) != timers_.end()) {
 	    timers_[handle].active = false;
+	    pthread_mutex_unlock(&mutex_);
 	    return true;
 	}
+	pthread_mutex_unlock(&mutex_);
 	return false;
     }
 
     void removeTimer(void) {
-        std::unique_lock<std::mutex> lock(mutex_);
+	pthread_mutex_lock(&mutex_);
 	timers_.clear();
 	base_interval_msec_ = FJTIMERLITE_MAX_TICK_MSEC;
+	pthread_mutex_unlock(&mutex_);
     }
 
     /*
@@ -158,10 +155,14 @@ public:
      * @retval [false] 存在しないハンドルか不活性
      */
     bool isActiveTimer(fjt_handle_t handle) {
-        std::unique_lock<std::mutex> lock(mutex_);
+	pthread_mutex_lock(&mutex_);
+
 	if (timers_.find(handle) != timers_.end()) {
-	    return timers_[handle].active;
+	    bool isact = timers_[handle].active;
+	    pthread_mutex_unlock(&mutex_);
+	    return isact;
 	}
+	pthread_mutex_unlock(&mutex_);
 	return false;
     }
 
@@ -172,7 +173,7 @@ private:
     struct TimerInfo {
 	FJUnitFrames *obj; //!< FJUnitFramesのポインタ
 	std::function<int(fjt_handle_t,fjt_time_t)> mf; //!< FJUnitFramesの関数ポインタ
-	uint32_t interval_msec; //!< 周期(msec)
+	fjt_time_t interval_msec; //!< 周期(msec)
 	fjt_time_t next_time; //!< 次回実行時刻
 	bool active; ///!< 活性状態
 	fjt_time_t start; //!< 登録時刻
@@ -183,7 +184,7 @@ private:
 	 * @brief デフォルトコンストラクタ
 	 */
 	TimerInfo(): obj(0), mf(0), interval_msec(0), active(0), srcfunc(""), srcline(0) {
-	    start = next_time = std::chrono::steady_clock::now();
+	    start = next_time = _get_time();
 	};
 
 	/**
@@ -194,15 +195,22 @@ private:
 	 */
 	TimerInfo(FJUnitFrames *o, std::function<int(fjt_handle_t,fjt_time_t)> m, uint32_t i, std::string sf, uint32_t sl):
 	    obj(o), mf(m), interval_msec(i), active(true), srcfunc(sf), srcline(sl) {
-	    start = std::chrono::steady_clock::now(); next_time = start + std::chrono::milliseconds(interval_msec);
+	    start = _get_time(); next_time = start + interval_msec;
 	};
     };
+
+    static void* timerFunc(void* arg) {
+        static_cast<FJTimerLite*>(arg)->timerThread();
+	return nullptr;
+    }
 
     /**
      * @brief コンストラクタ
      */
     FJTimerLite() : stop_(false), running_(false), base_interval_msec_(FJTIMERLITE_MAX_TICK_MSEC) {
-        worker_ = std::thread(&FJTimerLite::TimerThread, this);
+        pthread_mutex_init(&mutex_, NULL);
+        pthread_cond_init(&cv_, NULL);
+        pthread_create(&worker_, NULL, &FJTimerLite::timerFunc, this);
     }
 
     /**
@@ -215,11 +223,12 @@ private:
      */
     FJTimerLite& operator=(const FJTimerLite&) = delete;
 
+
     /**
      * @brief タイマーワーカースレッド
      */
-    void TimerThread() {
-	uint64_t wait;
+    void timerThread() {
+	fjt_time_t wait;
 	std::unordered_map<fjt_handle_t, TimerInfo>::iterator it;
 
 	fjt_handle_t handle = 0;
@@ -229,31 +238,41 @@ private:
 	fjt_time_t next_exec;
 	
 	{
-	    std::unique_lock<std::mutex> lock(mutex_);
+            pthread_mutex_lock(&mutex_);
+
 	    wait = base_interval_msec_;
 	    it = timers_.begin();
+
+            pthread_mutex_unlock(&mutex_);
+
 	}
 
         while (true) {
 	    {
-		std::unique_lock<std::mutex> lock(mutex_);
+		pthread_mutex_lock(&mutex_);
+
 		running_ = false;
 
-		auto now = std::chrono::steady_clock::now();
-		next_exec = now + std::chrono::milliseconds(FJTIMERLITE_MAX_TICK_MSEC);
+		auto now = _get_time();
+		next_exec = now + FJTIMERLITE_MAX_TICK_MSEC;
 		for (const auto& kv : timers_) {
 		    const TimerInfo& t = kv.second;
 		    if (t.active && t.next_time < next_exec)
 			next_exec = t.next_time;
 		}
 		
-		wait = std::chrono::duration_cast<std::chrono::milliseconds>(next_exec - now).count();
+		wait = next_exec - now;
 		if (wait < FJTIMERLITE_MIN_TICK_MSEC)
 		    wait = FJTIMERLITE_MIN_TICK_MSEC;
 
-		cond_var_.wait_for(lock, std::chrono::milliseconds(wait));
+		struct timespec next;
+		_get_future_timespec(&next, wait);
+		pthread_cond_timedwait(&cv_, &mutex_, &next);
 
-		if (stop_) return;
+		if (stop_) {
+		    pthread_mutex_unlock(&mutex_);
+		    return;
+		}
 
 		if (it == timers_.end()) {
 		    it = timers_.begin();
@@ -261,14 +280,16 @@ private:
 			base_interval_msec_ = FJTIMERLITE_MAX_TICK_MSEC;
 		    }
 		    wait = base_interval_msec_;
+		    pthread_mutex_unlock(&mutex_);
 		    continue;
 		}
 
-		now = std::chrono::steady_clock::now();
+		now = _get_time();
 		TimerInfo& timer = it->second;
 
 		if (!timer.active || now < timer.next_time) {
 		    ++it;
+		    pthread_mutex_unlock(&mutex_);
 		    continue;
 		}
 
@@ -276,21 +297,22 @@ private:
 
 #if FJTIMERLITE_PROFILE_DBG == 1
 		{
-		    auto delay = std::chrono::steady_clock::now();
-		    auto elapsed1 = std::chrono::duration_cast<std::chrono::milliseconds>(delay - timer.start);	    
+		    auto delay = _get_time();
+		    auto elapsed1 = delay - timer.start;	    
 		    timer.start = delay;
-		    std::cerr << timer.srcfunc << "(" << timer.srcline << "): *exec timer* delay = " << elapsed1.count() << " msec. " << std::endl;
+		    std::cerr << timer.srcfunc << "(" << timer.srcline << "): *exec timer* delay = " << elapsed1 << " msec. " << std::endl;
 		}
 #endif
 		handle = it->first;
 		obj = timer.obj;
 		mf = timer.mf;
-		timer.next_time = now + std::chrono::milliseconds(timer.interval_msec);
+		timer.next_time = now + timer.interval_msec;
+		pthread_mutex_unlock(&mutex_);
 	    }
 
 	    auto task = [mf, obj, handle, &result]() {
 		if (mf && obj) {
-		    auto now = std::chrono::steady_clock::now();
+		    auto now = _get_time();
 		    result = mf(handle, now);
 		}
 	    };
@@ -298,7 +320,7 @@ private:
 	    task(); // 実行
 
 	    {
-		std::unique_lock<std::mutex> lock(mutex_);
+		pthread_mutex_lock(&mutex_);
 		if (result < 0) {
 		    if (timers_.find(handle) != timers_.end()) {
 			timers_[handle].active = false;
@@ -306,17 +328,18 @@ private:
 		}
 		wait = FJTIMERLITE_MIN_TICK_MSEC;
 		++it;
+		pthread_mutex_unlock(&mutex_);
 	    }
 	}
     }
 
 
-    uint16_t base_interval_msec_; //!< ベース周期(msec)
+    int64_t base_interval_msec_; //!< ベース周期(msec)
     bool running_;
     bool stop_; //!< 終了宣言フラグ
-    std::mutex mutex_; //!< 排他
-    std::condition_variable cond_var_; //!< 状態変数
-    std::thread worker_; //!< タイマーワーカースレッド
+    pthread_mutex_t mutex_; //!< 排他
+    pthread_cond_t cv_; //!< 状態変数
+    pthread_t worker_; //!< タイマーワーカースレッド
 
     std::unordered_map<fjt_handle_t, TimerInfo> timers_; //!< タイマー情報管理テーブル
 };

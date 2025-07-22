@@ -17,16 +17,13 @@
 /**
  * @file fjdispatchlite.h
  * @author FJD
- * @date 2025.5.29
+ * @date 2025.7.21
  */
 #ifndef __FJDISPATCHLITE_H__
 #define __FJDISPATCHLITE_H__
 
 #ifndef DOXYGEN_SKIP_THIS
 #include <iostream>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <queue>
 #include <string>
 #include <algorithm>
@@ -37,6 +34,8 @@
 #include <future>
 #include <stdint.h>
 #include <time.h>
+#include <unistd.h>
+#include <pthread.h>
 #endif
 
 #include "fjtypes.h"
@@ -44,15 +43,17 @@
 
 #define FJDISPATCHLITE_DEFAULT_THREADS (2) //!< ワーカースレッド数初期値
 #define FJDISPATCHLITE_MAX_THREADS (8) //!< ワーカースレッド数最大値
+#define FJDISPATCHLITE_MIN_THREADS (1) //!< ワーカースレッド数最小値
 #define FJDISPATCHLITE_MAX_RESULTS (100) //!< リザルトキューの最大値
+#define FJDISPATCHLITE_IDLE_TIMEOUT_MSEC (60000)  //!< スレッドをシュリンクするタイムアウト値
+#define FJDISPATCHLITE_HUNG_TIMEOUT_MSEC (15000)   //!< タスクが固まった判定タイムアウト値
 
 #define FJDISPATCHLITE_DBG (0) //!< デバッグフラグ
 #define FJDISPATCHLITE_PROFILE_DBG (0) //!< メソッド実行プロファイラ
-#define FJDISPATCHLITE_PROFILE_ENQUEUE (0) //!< enqueueTaskデバッグフラグ
-#define FJDISPATCHLITE_PROFILE_ENQUEUE_MSEC (10000)  //!< enqueueTask統計情報を出力する間隔(msec)
-#define FJDISPATCHLITE_PROFILE_ENQUEUE_HNUM (100)  //!< enqueueTask統計情報を出力するハンドル数
 #define FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC (200) //!< postQueueしてから実行されるまでの遅延許容値(msec)
 #define FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC (200) //!< メソッド実行にかかる時間の許容値(msec)
+#define FJDISPATCHLITE_PROFILE_MONITOR_IVAL_MSEC (5000) 
+
 
 // 前方参照
 class FJTimerLite;
@@ -70,8 +71,7 @@ public:
      */
     struct ResultItem {
 	int value; //!< タスクの返り値
-	std::condition_variable cv; //!< タスク完了の状態変数
-	bool ready = false; //!< 実行結果を受け取ったか
+        bool ready; //!< 実行結果を受け取ったか
     };
 
     /*
@@ -87,13 +87,19 @@ public:
      */
     ~FJDispatchLite() {
         {
-            std::unique_lock<std::mutex> lock(mutex_);
+	    pthread_mutex_lock(&mutex_);
             stop_ = true;
-            cv_.notify_all();
+	    pthread_cond_broadcast(&cv_);
+	    pthread_mutex_unlock(&mutex_);
         }
-        for(auto& t : workers_) {
-            if(t.joinable()) t.join();
+        pthread_join(monitor_thread_, nullptr);
+        for (auto& t : workers_) {
+	    pthread_join(t.thread, nullptr);
         }
+        pthread_mutex_destroy(&mutex_);
+        pthread_cond_destroy(&cv_);
+        pthread_mutex_destroy(&result_mutex_);
+        pthread_cond_destroy(&result_cv_);
     }
 
     /**
@@ -105,7 +111,7 @@ public:
     {
 	handle = getHandle();
 	{
-	    std::lock_guard<std::mutex> lock(result_mutex_);
+	    pthread_mutex_lock(&result_mutex_);
 	    // 結果アイテムの登録と古い結果をキューから削除
 	    results_[handle] = result;
 	    result_order_.push_back(handle);
@@ -114,7 +120,8 @@ public:
 		result_order_.pop_front();
 		results_.erase(old);
 	    }
-	    result_cv_.notify_all();
+	    pthread_cond_broadcast(&result_cv_);
+	    pthread_mutex_unlock(&result_mutex_);
 	}
     }
 
@@ -125,13 +132,13 @@ public:
      */
     void _post_resultitem( fjt_handle_t handle, int value)
     {
-	std::lock_guard<std::mutex> lock(result_mutex_);
+        pthread_mutex_lock(&result_mutex_);
 	auto it = results_.find(handle);
 	if (it != results_.end()) {
 	    it->second->value = value;
 	    it->second->ready = true;
-	    it->second->cv.notify_all();
 	}
+        pthread_mutex_unlock(&result_mutex_);
     }
 
     /**
@@ -151,7 +158,7 @@ public:
     fjt_handle_t postQueue(T* obj, int (T::*mf)(uint32_t, void*, uint32_t), uint32_t msg, void* buf, uint32_t len, bool isseq, std::string srcfunc, uint32_t srcline) {
 	static_assert(std::is_base_of<FJUnitFrames, T>::value, "T must derive from FJUnitFrames");
 	// start_time
-	auto start = std::chrono::steady_clock::now();
+	auto start = _get_time();
         // bufをコピー
         char* buf_copy = new char[len];
         std::memcpy(buf_copy, static_cast<char *>(buf), len);
@@ -164,27 +171,32 @@ public:
 	_new_resultitem( handle, result );
 #if FJDISPATCHLITE_DBG == 1
 	{
-	    uint32_t timeMs = _get_time();
-	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << COLOR_RESET << std::endl;
+	    std::cerr << COLOR_CYAN << "[" << start << "]:" << srcfunc  << COLOR_RESET << std::endl;
 	}
 #endif
 	// lambda式でタスクを定義
-	auto lambda = [obj, mf, msg, buf_copy, len, srcfunc_copy, srcline, start, result, handle, this]() {
+        auto lambda = [=]() {
+	    auto delay = _get_time();
+            pthread_mutex_lock(&mutex_);
+            for (auto& w : workers_) {
+                if (pthread_self() == w.thread) {
+                    w.task_start_ms = delay;
+                    w.task_srcfunc = srcfunc_copy;
+                }
+            }
+            pthread_mutex_unlock(&mutex_);
 #if FJDISPATCHLITE_PROFILE_DBG == 1
-	    auto delay = std::chrono::steady_clock::now();
-	    auto elapsed1 = std::chrono::duration_cast<std::chrono::milliseconds>(delay - start);	    
-	    if (elapsed1.count() > FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC) {
-		uint32_t timeMs = _get_time();
-		std::cerr << COLOR_RED << "[" << timeMs << "]:" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is DELAYED. " << elapsed1.count() << " msec." << COLOR_RESET << std::endl;
+	    auto elapsed1 = delay - start;	    
+	    if (elapsed1 > FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC) {
+		std::cerr << COLOR_RED << "[" << delay << "]:" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is DELAYED. " << elapsed1 << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
 	    int ret = (obj->*mf)(msg, buf_copy, len);
 #if FJDISPATCHLITE_PROFILE_DBG == 1
-	    auto now = std::chrono::steady_clock::now();
-	    auto elapsed2 = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-	    if (elapsed2.count() > FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC) {
-		uint32_t timeMs = _get_time();
-		std::cerr << COLOR_RED << "[" << timeMs << "]" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is TOO LONG. " << elapsed2.count() << " msec." << COLOR_RESET << std::endl;
+	    auto now = _get_time();
+	    auto elapsed2 = now - start;
+	    if (elapsed2 > FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC) {
+		std::cerr << COLOR_RED << "[" << now << "]" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is TOO LONG. " << elapsed2 << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
 
@@ -193,26 +205,27 @@ public:
 
 	    // 結果の登録
 	    _post_resultitem(handle, ret);
-        };
+        }; 
 
 	auto task = std::make_unique<std::packaged_task<void()>>(lambda);
 
 	// インスタンスのタスクキューに所有権を移動
-        std::unique_lock<std::mutex> lock(mutex_);
-	auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
-        inst_info.task_queue.push(std::move(task));
-
-	// インスタンスのタスクキューが実行中でないか、パラで動作させるフラグが立っていたら
-	if (!inst_info.running || isseq == false) {
-	    // 実行待ちタスクに登録して実行中に
-	    ready_instances_.push(static_cast<FJUnitFrames*>(obj));
-            inst_info.running = true;
-
+	{
+	    pthread_mutex_lock(&mutex_);
+	    auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
+	    inst_info.task_queue.push(std::move(task));
+	    // インスタンスのタスクキューが実行中でないか、パラで動作させるフラグが立っていたら
+	    if (!inst_info.running || !isseq) {
+		// 実行待ちタスクに登録して実行中に
+		ready_instances_.push(static_cast<FJUnitFrames*>(obj));
+		inst_info.running = true;
+		// イベント送信
+		pthread_cond_signal(&cv_);
+	    }
 	    // ワーカースレッドを必要に応じて拡張
-	    _strech_workers();
-	    // イベント送信
-            cv_.notify_one();
-        }
+            _adjust_workers();
+	    pthread_mutex_unlock(&mutex_);
+         }
 
 	return handle;
     }
@@ -231,7 +244,7 @@ public:
     fjt_handle_t postEvent(T* obj, int (T::*mf)(uint32_t), uint32_t msg, std::string srcfunc, uint32_t srcline) {
 	static_assert(std::is_base_of<FJUnitFrames, T>::value, "T must derive from FJUnitFrames");
 	// start_time
-	auto start = std::chrono::steady_clock::now();
+	auto start = _get_time();
 	// srcfuncをコピー
 	char *srcfunc_copy = new char[srcfunc.size()+1];
 	std::strcpy(srcfunc_copy, srcfunc.c_str());
@@ -241,27 +254,32 @@ public:
 	_new_resultitem( handle, result );
 #if FJDISPATCHLITE_DBG == 1
 	{
-	    uint32_t timeMs = _get_time();
-	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << COLOR_RESET << std::endl;
+	    std::cerr << COLOR_CYAN << "[" << start << "]:" << srcfunc  << COLOR_RESET << std::endl;
 	}
 #endif
 	// lambda式でタスクを定義
-	auto lambda = [obj, mf, msg, srcfunc_copy, srcline, start, result, handle, this]() {
+        auto lambda = [=]() {
+	    auto delay = _get_time();
+            pthread_mutex_lock(&mutex_);
+            for (auto& w : workers_) {
+                if (pthread_self() == w.thread) {
+                    w.task_start_ms = delay;
+                    w.task_srcfunc = srcfunc_copy;
+                }
+            }
+            pthread_mutex_unlock(&mutex_);
 #if FJDISPATCHLITE_PROFILE_DBG == 1
-	    auto delay = std::chrono::steady_clock::now();
-	    auto elapsed1 = std::chrono::duration_cast<std::chrono::milliseconds>(delay - start);	    
-	    if (elapsed1.count() > FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC) {
-		uint32_t timeMs = _get_time();
-		std::cerr << COLOR_RED << "[" << timeMs << "]:" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is DELAYED. " << elapsed1.count() << " msec." << COLOR_RESET << std::endl;
+	    auto elapsed1 = delay - start;	    
+	    if (elapsed1 > FJDISPATCHLITE_PROFILE_TOO_DELAY_MSEC) {
+		std::cerr << COLOR_RED << "[" << delay << "]:" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution is DELAYED. " << elapsed1 << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
 	    int ret = (obj->*mf)(msg);
 #if FJDISPATCHLITE_PROFILE_DBG == 1
-	    auto now = std::chrono::steady_clock::now();
-	    auto elapsed2 = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-	    if (elapsed2.count() > FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC) {
-		uint32_t timeMs = _get_time();
-		std::cerr << COLOR_RED << "[" << timeMs << "]" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is TOO LONG. " << elapsed2.count() << " msec." << COLOR_RESET << std::endl;
+	    auto now = _get_time();
+	    auto elapsed2 = now - start;
+	    if (elapsed2 > FJDISPATCHLITE_PROFILE_TOO_EXEC_MSEC) {
+		std::cerr << COLOR_RED << "[" << now << "]" << srcfunc_copy << "(" << srcline << "): *WARNING* function execution time is TOO LONG. " << elapsed2 << " msec." << COLOR_RESET << std::endl;
 	    }
 #endif
 
@@ -274,20 +292,21 @@ public:
 	auto task = std::make_unique<std::packaged_task<void()>>(lambda);
 
 	// インスタンスのタスクキューに所有権を移動
-        std::unique_lock<std::mutex> lock(mutex_);
-	auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
-        inst_info.task_queue.push(std::move(task));
-
-	// インスタンスのタスクキューが実行中でないか、パラで動作させるフラグが立っていたら
-	if (!inst_info.running) {
-	    // 実行待ちタスクに登録して実行中に
-	    ready_instances_.push(static_cast<FJUnitFrames*>(obj));
-            inst_info.running = true;
-
+	{
+	    pthread_mutex_lock(&mutex_);
+	    auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
+	    inst_info.task_queue.push(std::move(task));
+	    // インスタンスのタスクキューが実行中でないか
+	    if (!inst_info.running) {
+		// 実行待ちタスクに登録して実行中に
+		ready_instances_.push(static_cast<FJUnitFrames*>(obj));
+		inst_info.running = true;
+		// イベント送信
+		pthread_cond_signal(&cv_);
+	    }
 	    // ワーカースレッドを必要に応じて拡張
-	    _strech_workers();
-	    // イベント送信
-            cv_.notify_one();
+            _adjust_workers();
+	    pthread_mutex_unlock(&mutex_);
         }
 
 	return handle;
@@ -299,68 +318,28 @@ public:
      * @param[in] obj FJUnitFramesのポインタ
      * @param[in] task std::packaged_task
      */
-#if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
-    template <typename T>
-    fjt_handle_t enqueueTask(T* obj, std::packaged_task<void()>&& task, std::string srcfunc, uint32_t srcline) {
-#else
     template <typename T>
     fjt_handle_t enqueueTask(T* obj, std::packaged_task<void()>&& task) {
-#endif
 	static_assert(std::is_base_of<FJUnitFrames, T>::value, "T must derive from FJUnitFrames");
 	fjt_handle_t handle = getHandle();
-#if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
-	{
-            std::lock_guard<std::mutex> lock(enqueue_mutex_);
-	    ++enqueues_[srcfunc];
-	    if (enqueue_start_ == 0) {
-		enqueue_start_ = _get_time();
-		enqueue_handle_ = handle;
-	    } else {
-		if ((handle % FJDISPATCHLITE_PROFILE_ENQUEUE_HNUM) == 1) {
-		    uint32_t now = _get_time();
-		    if ((now - enqueue_start_) >= FJDISPATCHLITE_PROFILE_ENQUEUE_MSEC) {
-			std::vector<std::pair<std::string, uint32_t>> vec(enqueues_.begin(), enqueues_.end()); 
-			std::sort(vec.begin(), vec.end(),
-			    [](const auto& a, const auto& b) {
-				return a.second > b.second;
-			    });
-			std::cerr << COLOR_CYAN << "----------[" << now << ":" << enqueue_start_ << "(" << handle - enqueue_handle_ << ")]----------" << std::endl;
-			for (const auto& [key, value] : vec) {
-			    std::cerr << value << ", " << key << std::endl;
-			}
-
-			std::cerr << "--------------------------------" << COLOR_RESET << std::endl;
-			enqueues_.clear();
-			enqueue_start_ = _get_time();
-			enqueue_handle_ = handle;
-		    }
-		}
-	    }
-	}
-#if FJDISPATCHLITE_DBG == 1
-	{
-	    uint32_t timeMs = _get_time();
-	    std::cerr << COLOR_CYAN << "[" << timeMs << "]:" << srcfunc  << "(" << srcline << ")" << COLOR_RESET << std::endl;
-	}
-#endif //DBG
-#endif //ENQUEUE
 
 	// インスタンスのタスクキューに所有権を移動
-        std::unique_lock<std::mutex> lock(mutex_);
-	auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
-	auto task_ptr = std::make_unique<std::packaged_task<void()>>(std::move(task));
-	inst_info.task_queue.push(std::move(task_ptr));
-
-	// インスタンスのタスクキューが実行中でないか、パラで動作させるフラグが立っていたら
-	if (!inst_info.running) {
-	    // 実行待ちタスクに登録して実行中に
-	    ready_instances_.push(static_cast<FJUnitFrames*>(obj));
-            inst_info.running = true;
-
+	{
+	    pthread_mutex_lock(&mutex_);
+	    auto& inst_info = instance_map_[static_cast<FJUnitFrames*>(obj)];
+	    auto task_ptr = std::make_unique<std::packaged_task<void()>>(std::move(task));
+	    inst_info.task_queue.push(std::move(task_ptr));
+	    // インスタンスのタスクキューが実行中でないか
+	    if (!inst_info.running) {
+		// 実行待ちタスクに登録して実行中に
+		ready_instances_.push(static_cast<FJUnitFrames*>(obj));
+		inst_info.running = true;
+		// イベント送信
+		pthread_cond_signal(&cv_);
+	    }
 	    // ワーカースレッドを必要に応じて拡張
-	    _strech_workers();
-	    // イベント送信
-            cv_.notify_one();
+	    _adjust_workers();
+	    pthread_mutex_unlock(&mutex_);
         }
 
 	return handle;
@@ -375,32 +354,44 @@ public:
      * @retval [false] 待受ハンドルの実行結果が見つからない
      */
     bool waitResult(fjt_handle_t handle, uint32_t timeout_msec, int& result_out) {
-        auto start = std::chrono::steady_clock::now();
-        std::unique_lock<std::mutex> lock(result_mutex_);
+	auto start = _get_time();
+        pthread_mutex_lock(&result_mutex_);
 
         while (true) {
             auto it = results_.find(handle);
             if (it != results_.end()) {
+		// テーブルに存在し
                 auto& item = it->second;
                 if (item->ready) {
+		    // 実行完了している
                     result_out = item->value;
+                    pthread_mutex_unlock(&result_mutex_);
                     return true;
-                }
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-                if (elapsed.count() >= timeout_msec) return false;
-
-                item->cv.wait_for(lock, std::chrono::milliseconds(timeout_msec) - elapsed);
-            } else {
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-                if (elapsed.count() >= timeout_msec) return false;
-                result_cv_.wait_for(lock, std::chrono::milliseconds(50));
-            }
+		}
+	    }		
+	    auto now = _get_time();
+	    auto elapsed = now - start;
+	    if (elapsed >= timeout_msec) {
+		pthread_mutex_unlock(&result_mutex_);
+		return false;
+	    }
+	    struct timespec next;
+	    _get_future_timespec(&next, elapsed > 33 ? 33 : elapsed);
+	    pthread_cond_timedwait(&result_cv_, &result_mutex_, &next);
         }
     }
 
 private:
+    /**
+     * @brief ワーカーの動作状況
+     */
+    struct WorkerInfo {
+        pthread_t thread;
+        uint64_t last_active_ms;
+        uint64_t task_start_ms = 0;
+        std::string task_srcfunc;
+    };
+
     /**
      * @brief 各FJUintFramesごとのインスタンス情報
      */
@@ -413,16 +404,47 @@ private:
      * @brief デフォルトコンストラクタ
      */
     FJDispatchLite() : stop_(false), num_of_threads_(FJDISPATCHLITE_DEFAULT_THREADS) {
-#if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
-	enqueue_start_ = 0;
-	enqueue_handle_ = 0;
+        pthread_mutex_init(&mutex_, NULL);
+        pthread_cond_init(&cv_, NULL);
+        pthread_mutex_init(&result_mutex_, NULL);
+        pthread_cond_init(&result_cv_, NULL);
+        for (int i = 0; i < num_of_threads_; ++i) _spawn_worker();
+        pthread_create(&monitor_thread_, NULL, &FJDispatchLite::monitorFunc, this);
+    }
+
+    void _spawn_worker() {
+        WorkerInfo info;
+        info.last_active_ms = _get_time();
+        pthread_create(&info.thread, NULL, &FJDispatchLite::workerFunc, this);
+        workers_.push_back(info);
+    }
+
+    void _adjust_workers() {
+        if (ready_instances_.size() > num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
+            _spawn_worker();
+            ++num_of_threads_;
+#if FJDISPATCHLITE_DBG != 0
+	    std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
 #endif
-        for(int i=0; i<num_of_threads_; ++i) {
-            workers_.emplace_back(&FJDispatchLite::workerThread, this);
+        }
+    }
+    
+    void _shrink_workers() {
+        auto now = _get_time();
+        for (auto it = workers_.begin(); it != workers_.end();) {
+            if (workers_.size() <= FJDISPATCHLITE_MIN_THREADS) break;
+            if (now - it->last_active_ms >= FJDISPATCHLITE_IDLE_TIMEOUT_MSEC) {
+                pthread_cancel(it->thread);
+                pthread_join(it->thread, nullptr);
+                it = workers_.erase(it);
+                --num_of_threads_;
+            } else {
+                ++it;
+            }
         }
     }
 
-    /**
+   /**
      * @brief コピー禁止コンストラクタ
      */
     FJDispatchLite(const FJDispatchLite&) = delete;
@@ -433,115 +455,110 @@ private:
     FJDispatchLite& operator=(const FJDispatchLite&) = delete;
 
     /**
-     * @brief 32bit epoch time(JKDispatchLite)
-     */
-    static uint32_t _get_time() {
-	uint32_t timeMs;
-	struct timespec ts;
-	int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts); 
-	timeMs = ((uint32_t)ts.tv_sec * 1000) + ((uint32_t)ts.tv_nsec / 1000000);
-	return timeMs;
-    }
-
-    /**
      * @brief 新しいハンドルを確保
      * @return 新しいハンドル
      */
     fjt_handle_t getHandle() {
-	std::lock_guard<std::mutex> lock(result_mutex_);
+	pthread_mutex_lock(&mutex_);
 	fjt_handle_t handle = ++handle_counter_;
 	if (handle >= INT64_MAX) handle_counter_ = 1;
+	pthread_mutex_unlock(&mutex_);
 	return handle;
+    }
+
+    static void* workerFunc(void* arg) {
+        static_cast<FJDispatchLite*>(arg)->workerThread();
+        return nullptr;
+    }
+
+    static void* monitorFunc(void* arg) {
+        FJDispatchLite* self = static_cast<FJDispatchLite*>(arg);
+        while (!self->stop_) {
+            pthread_mutex_lock(&self->mutex_);
+            auto now = _get_time();
+            for (const auto& w : self->workers_) {
+                if (!w.task_srcfunc.empty() && (now - w.task_start_ms >= FJDISPATCHLITE_HUNG_TIMEOUT_MSEC)) {
+                    std::cerr << COLOR_YELLOW << "[MONITOR] Hung task: " << w.task_srcfunc << " (" << (now - w.task_start_ms) << "ms)" << COLOR_RESET << std::endl;
+                }
+            }
+            pthread_mutex_unlock(&self->mutex_);
+	    usleep(FJDISPATCHLITE_PROFILE_MONITOR_IVAL_MSEC * 1000);
+        }
+        return nullptr;
     }
 
     /**
      * @brief ワーカースレッドの実装
      */
     void workerThread() {
-        while(true) {
+        while (true) {
             FJUnitFrames* inst = nullptr;
 	    std::unique_ptr<std::packaged_task<void()>> task;
 
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-		// 終了宣言済みか、または、実行待ちタスクがあるとき抜ける
-                cv_.wait(lock, [this]{
-                    return stop_ || !ready_instances_.empty();
-                });
-
-                if(stop_) return;
-
-		// インスタンスをpop
-                inst = ready_instances_.front();
-                ready_instances_.pop();
-
-                auto& inst_info = instance_map_[inst];
-                if(inst_info.task_queue.empty()) {
-		    // インスタンスのタスクキューが空ならば止める
-                    inst_info.running = false;
-                    continue;
-                }
-
-		// タスクの所有権をタスクキューからこのコンテキストに移動
-                task = std::move(inst_info.task_queue.front());
-                inst_info.task_queue.pop();
-		
-            }
+	    pthread_mutex_lock(&mutex_);
+	    // 終了宣言済みか、または、実行待ちタスクがあるとき抜ける
+	    while (!stop_ && ready_instances_.empty()) pthread_cond_wait(&cv_, &mutex_);
+	    if (stop_) {
+		pthread_mutex_unlock(&mutex_);
+		break;
+	    }
+	    // インスタンスをpop
+	    inst = ready_instances_.front();
+	    ready_instances_.pop();
+	    auto& inst_info = instance_map_[inst];
+	    if (inst_info.task_queue.empty()) {
+		// インスタンスのタスクキューが空ならば止める
+		inst_info.running = false;
+		pthread_mutex_unlock(&mutex_);
+		continue;
+	    }
+	    // タスクの所有権をタスクキューからこのコンテキストに移動
+	    task = std::move(inst_info.task_queue.front());
+	    inst_info.task_queue.pop();
+	    pthread_mutex_unlock(&mutex_);
 
             // タスク実行(排他範囲外にしておくこと)
             (*task)();
 
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                auto& inst_info = instance_map_[inst];
-                if(!inst_info.task_queue.empty()) {
-		    // まだタスクキューが空でなかったら実行待ちタスクに登録
-                    ready_instances_.push(inst);
-                    cv_.notify_one();
-                }
-                else {
-		    // このインスタンスで処理するものがなかったら止める
-                    inst_info.running = false;
-                }
+	    pthread_mutex_lock(&mutex_);
 
-            }
-        }
-    }
+	    for (auto& w : workers_) {
+		if (pthread_self() == w.thread) {
+		    w.last_active_ms = _get_time();
+		    w.task_srcfunc.clear();
+		    break;
+		}
+	    }
+	    if (!inst_info.task_queue.empty()) {
+		// まだタスクキューが空でなかったら実行待ちタスクに登録
+		ready_instances_.push(inst);
+		pthread_cond_signal(&cv_);
+	    } else {
+		// このインスタンスで処理するものがなかったら止める
+		inst_info.running = false;
+	    }
 
-    /**
-     * @brief ワーカースレッドを必要に応じて拡張
-     */
-    void _strech_workers() {
-	if (ready_instances_.size() >= num_of_threads_ && num_of_threads_ < FJDISPATCHLITE_MAX_THREADS) {
-	    workers_.emplace_back(&FJDispatchLite::workerThread, this);
-	    ++num_of_threads_;
-#if FJDISPATCHLITE_DBG != 0
-	    std::cerr << COLOR_RED << "*WARNING* worker threads++ (" << num_of_threads_ << ")" << COLOR_RESET << std::endl;
-#endif
+	    pthread_mutex_unlock(&mutex_);
 	}
     }
 
 private:
-    std::mutex mutex_; //!< 排他
-    std::condition_variable cv_; //!< 状態変数
+    pthread_mutex_t mutex_; //!< 排他
+    pthread_cond_t cv_; //!< 状態変数
     bool stop_; //!< 終了宣言変数
-    std::vector<std::thread> workers_; //!< ワーカースレッド
+    std::vector<WorkerInfo> workers_; //!< ワーカースレッド
     size_t num_of_threads_ = FJDISPATCHLITE_DEFAULT_THREADS; //!< ワーカースレッドの数
 
     std::unordered_map<FJUnitFrames*, InstanceInfo> instance_map_; //!< インスタンス管理テーブル
     std::queue<FJUnitFrames*> ready_instances_; //!< 実行待ちタスク
 
-    std::mutex result_mutex_; //!< リザルト排他
-    std::condition_variable result_cv_; //!< リザルト状態変数
-    std::unordered_map<uint64_t, std::shared_ptr<ResultItem>> results_; //!< リザルトテーブル
-    std::deque<uint64_t> result_order_;  //! 順序付きでリザルト保存
-    uint64_t handle_counter_ = 0; //!< ハンドルカウンタ
-#if FJDISPATCHLITE_PROFILE_ENQUEUE == 1
-    std::mutex enqueue_mutex_; //!< enqueue結果排他
-    std::unordered_map<std::string, uint32_t> enqueues_; //!< enqueue結果テーブル
-    uint32_t enqueue_start_; //!< ロギング開始epoch
-    fjt_handle_t enqueue_handle_; //!< ロギング開始ハンドル
-#endif
+    pthread_mutex_t result_mutex_; //!< リザルト排他
+    pthread_cond_t result_cv_; //!< リザルト状態変数
+    std::unordered_map<fjt_handle_t, std::shared_ptr<ResultItem>> results_; //!< リザルトテーブル
+    std::deque<fjt_handle_t> result_order_;  //! 順序付きでリザルト保存
+    fjt_handle_t handle_counter_ = 0; //!< ハンドルカウンタ
+
+    pthread_t monitor_thread_; //!< モニタースレッド
 };
 
 #endif //__FJDISPATCHLITE_H__
