@@ -51,7 +51,7 @@ class FJFixMap {
 	 , count_ptr_(&count)
     {
 	capacity_ = maxbufsize / sizeof(Entry);
-	assert(*count_ptr_ > capacity_);
+	assert(*count_ptr_ <= capacity_);
     }
 
     /**
