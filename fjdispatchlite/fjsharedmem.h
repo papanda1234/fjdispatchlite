@@ -45,6 +45,7 @@
 #define C_FJNT_LISTEN_MAX 256 //!< リスナーテーブル最大数
 #define C_FJNT_QUEUE_MAX 512 //!< メッセージキュー最大数
 #define C_FJNT_PROCESS_MAX 50 //!< 共有メモリを利用するプロセスの最大数
+#define C_FJNT_DEFAULT_EXTRA_SIZE 64 //!< 構造体無しの場合に確保する拡張領域のサイズ
 
 #define C_FJNT_PAYLOAD_MAX 512 //!< 付加データ最大サイズ(bytes)
 #define C_FJNT_PAYLOAD_SLOTS 200 //!< 付加データスロット数(複製含む)
@@ -126,7 +127,7 @@ public:
 			srcfunc_ = srcfunc;
 		}
 		if (!extra_size_) {
-			extra_size_ = 64;
+			extra_size_ = C_FJNT_DEFAULT_EXTRA_SIZE;
 		}
         bool is_create = false;
         int fd = shm_open(C_FJNT_SHAREDREGION_NAME, O_RDWR, 0666);
@@ -240,6 +241,7 @@ public:
 								pthread_mutex_unlock(&p->mutex_);
 								break;
 							}
+							pthread_mutex_unlock(&p->mutex_);
 							usleep(1000);
 						} while (i++ < timeoutMs);
 						if (i == timeoutMs) {
