@@ -21,11 +21,12 @@ public:
 int main() {
     Receiver receiver("/fjtestmem", __PRETTY_FUNCTION__);
 
-    std::cout << "Waiting for notification 15sec...\n";
+    std::cout << "Waiting for notification 15sec...";
 	for (int i = 0; i < 15; i++) {
-        sleep(15);
+        sleep(1);
+	std::cout << "." << std::flush;
     }
-    std::cout << "Done.\n";
+    std::cout << "\nDone.\n";
 
     return 0;
 }
