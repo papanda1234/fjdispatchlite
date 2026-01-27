@@ -20,7 +20,7 @@ public:
     FJMutex(const FJMutex&) = delete;
     FJMutex& operator=(const FJMutex&) = delete;
 private:
-    pthread_mutex_t mutex_;
+    pthread_mutex_t *mutex_;
 };
 
 class FJSyncGuard {
