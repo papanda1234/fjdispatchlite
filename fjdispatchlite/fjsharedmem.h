@@ -42,17 +42,17 @@
 #include "fjfixvector.h"
 #include "fjfixmap.h"
 
-#define C_FJNT_LISTEN_MAX 256 //!< リスナーテーブル最大数
-#define C_FJNT_QUEUE_MAX 512 //!< メッセージキュー最大数
-#define C_FJNT_PROCESS_MAX 50 //!< 共有メモリを利用するプロセスの最大数
+#define C_FJNT_LISTEN_MAX 128 //!< リスナーテーブル最大数
+#define C_FJNT_QUEUE_MAX 384 //!< メッセージキュー最大数
+#define C_FJNT_PROCESS_MAX 24 //!< 共有メモリを利用するプロセスの最大数
 #define C_FJNT_DEFAULT_EXTRA_SIZE 64 //!< 構造体無しの場合に確保する拡張領域のサイズ
 
 #define C_FJNT_PAYLOAD_MAX 512 //!< 付加データ最大サイズ(bytes)
-#define C_FJNT_PAYLOAD_SLOTS 200 //!< 付加データスロット数(複製含む)
+#define C_FJNT_PAYLOAD_SLOTS 384 //!< 付加データスロット数(複製含む)
 
 #define C_FJNT_SHAREDREGION_NAME "/fjsharedmem" //!< 管理領域の名前
 
-#define FJSHAREDMEM_DBG (1) //!< for debug.
+#define FJSHAREDMEM_DBG (0) //!< for debug.
 
 /**
  * @brief メッセージ通知付き共有メモリ
