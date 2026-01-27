@@ -8,6 +8,7 @@ public:
 	MID_ON_ONHOLD = 255,
     };
 
+
     virtual void run(char *buf, uint len);
     virtual int onHold(uint32_t msg, void* buf, uint32_t len);
     virtual int onTimer(fjt_handle_t handle, fjt_time_t now);
@@ -16,13 +17,16 @@ public:
     MAP_MESSAGES( MID_ON_ONHOLD, FJTestHold::onHold )
     END_MAP_MESSAGES()
 
+	bool running_;
 };
 
 int FJTestHold::onHold(uint32_t msg, void* buf, uint32_t len)
 {
     std::string s(static_cast<char *>(buf), len);
     std::cout << "onHold called for instance " << this << ": " << s << ": " << msg << std::endl;
-    CreateTimer(&FJTestHold::onTimer, 500);
+	if (running_) {
+		CreateTimer(&FJTestHold::onTimer, 500);
+	}
     return 0;
 }
 
@@ -42,20 +46,24 @@ int main() {
     FJDispatchLite* dispatch = FJDispatchLite::GetInstance();
     FJTestHold *C1 = new FJTestHold();
 
+	C1->running_ = true;
+
     std::cerr << "START" << std::endl;
 
     fjt_handle_t t1 = timer->createTimer(C1, &FJTestHold::onTimer, 1000, __FUNCTION__, __LINE__);
 
     std::cerr << "RUN" << std::endl;
 
-    sleep(5);
+	sleep(5);
 
-    std::cerr << "REMOVE" << std::endl;
+	timer->removeTimer(t1);
+	C1->running_ = false;
+	
+	sleep(5);
+   
+	std::cout << "DELETE" << std::endl;
+	delete C1;
 
-    FJTimerLite::GetInstance()->removeTimer(t1);
-
-    std::cout << "DELETE" << std::endl;
-    delete C1;
-    std::cout << "DELETE3" << std::endl;
-    return 0;
+	std::cout << "DELETE3" << std::endl;
+	return 0;
 }
