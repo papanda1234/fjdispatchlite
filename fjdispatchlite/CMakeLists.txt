@@ -60,3 +60,18 @@ target_link_libraries(test_timer pthread)
 set_target_properties(test_timer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build
 )
+
+# test_autosnake server/client
+add_executable(test_autosnake_server fjsharedmem.cpp fjtypes.cpp test/test_autosnake_server.cpp)
+target_link_libraries(test_autosnake_server pthread)
+target_link_libraries(test_autosnake_server rt)
+set_target_properties(test_autosnake_server PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build
+)
+
+add_executable(test_autosnake_client fjsharedmem.cpp fjtypes.cpp test/test_autosnake_client.cpp)
+target_link_libraries(test_autosnake_client pthread)
+target_link_libraries(test_autosnake_client rt)
+set_target_properties(test_autosnake_client PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build
+)
